@@ -228,6 +228,22 @@ First release. Peer: `unity-asset-reader@^1.2.0`, the first core that decodes `M
   `ExportMesh` writes, floats written as .NET writes them under en-US. Equal to AssetStudio's OBJ
   for the 12 fixture meshes (#239).
 
+## unity-asset-reader-audio
+
+Version 0.0.0 on disk until its first release, which the release workflow never publishes
+(`scripts/check-release.mjs`).
+
+### 1.0.0 - Unreleased
+
+First release. Peer: `unity-asset-reader@^1`.
+
+- `fsb5ToWav()` converts an `AudioClip`'s FSB5 sound bank to WAV, as AssetStudio's
+  `AudioClipConverter.ConvertToWav()` does, for PCM8, PCM16, PCM32, IMAADPCM (mono, stereo),
+  FADPCM and GCADPCM (mono); `readFsb5()` parses the bank (#236). Pure TypeScript, sync,
+  browser-safe. The PCM clips of the 2019.4.41f2, 2020.3.30f1 and 6000.3.25f1 fixture bundles
+  convert to AssetStudio's WAV byte for byte. Vorbis and the other codecs throw
+  `UnsupportedError`.
+
 ## texture2ddecoder-wasm
 
 ### 1.2.6 - 2026-10-16
