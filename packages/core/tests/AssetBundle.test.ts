@@ -123,9 +123,10 @@ test("the AssetBundle checks cover formats 21 and 22, typed and not, every edito
   for (const editor of ["2019.4.41f2 21", "2020.3.30f1 22", "6000.3.25f1 22"]) {
     for (const kind of ["typed", "notypetree"]) assert.ok(seen.has(`${editor} ${kind}`));
   }
-  // Every variant's four bundles, per editor, the Material bundle (#40), and
-  // audio, font and video (#41).
-  assert.equal(NO_TYPE_TREE.length, 24);
+  // Every variant's four bundles, per editor, the Material bundle (#40),
+  // audio, font and video (#41), and the shader bundles (#237): two from
+  // 2019.4, three each from 2020.3 and 6000.3.26f1.
+  assert.equal(NO_TYPE_TREE.length, 32);
 });
 
 // --- m_Container entries, resolved ----------------------------------------------
