@@ -10,7 +10,10 @@ to release is in [RELEASING.md](RELEASING.md).
   is published only when its version changes. Changing the `version` in a package's
   `package.json` on `main` is the release.
 - Each follows [semver](https://semver.org/). For the reader packages the public API is what the
-  package's `dist/index.d.ts` exports.
+  package's `dist/index.d.ts` exports. One exception, a maintainer decision (core 1.1.0, #232):
+  an exported type that narrows only for input earlier versions refused, such as a field made
+  optional because a newly supported layout lacks it, ships as a minor, with a **Type change**
+  note in its entry.
 - Between packages of this repo, ranges say what goes together. A feature package's
   `peerDependency` on `unity-asset-reader` is `^<major>` (for 1.x: `^1`), so any core of that
   major works with it; a breaking core release moves the feature packages' peer range with it.
@@ -21,7 +24,7 @@ to release is in [RELEASING.md](RELEASING.md).
 
 ## unity-asset-reader
 
-### 1.0.2 - Unreleased
+### 1.1.0 - 2026-10-16
 
 - `readSpriteAtlas` reads Unity 6000.6's layout instead of refusing it: no `m_PackedSprites` or
   `m_PackedSpriteNamesToIndex`, and every `m_RenderDataMap` entry holds its sprite as
@@ -30,8 +33,8 @@ to release is in [RELEASING.md](RELEASING.md).
   **Type change (breaks type-checked code that reads these fields unchecked):**
   `SpriteAtlas.m_PackedSprites` / `m_PackedSpriteNamesToIndex` and
   `SpriteAtlasFields.packedSprites` / `packedSpriteNamesToIndex` are optional (absent from
-  6000.6); `SpriteAtlasFields.renderDataMap` entries are `SpriteAtlasDataFields`. The next
-  release's version is the maintainer's decision; this heading's number does not settle it.
+  6000.6); `SpriteAtlasFields.renderDataMap` entries are `SpriteAtlasDataFields`. Released as a
+  minor: the data read from atlases before 6000.6 is unchanged, and 6000.6 atlases were refused.
 
 - Read SerializedFile format 23 metadata and generic type-tree dumps, tested against five
   Unity 6000.6.4f1 fixtures. Validate the bounded `mhtt` type-tree blobs and retain support
@@ -89,7 +92,7 @@ First release. The core: isomorphic, synchronous, no WASM.
 
 ## unity-asset-reader-texture
 
-### 1.0.2 - Unreleased
+### 1.1.0 - 2026-10-16
 
 - Decode the sprites a Unity 6000.6 `SpriteAtlas` holds itself
   (`SpriteAtlasFields.renderDataMap[i][1].spriteInstanceData`), which 6000.6 bundles have no
@@ -149,7 +152,7 @@ First release. Peer: `unity-asset-reader@^1`; depends on `texture2ddecoder-wasm@
 
 ## unity-asset-reader-node
 
-### 1.0.2 - Unreleased
+### 1.1.0 - 2026-10-16
 
 - `loadPath(file)` loads a loose serialized file's external dependencies from the same
   directory, transitively, with their sidecars and split parts. Missing externals are skipped;
@@ -172,10 +175,12 @@ First release. Peer: `unity-asset-reader@^1`.
 
 ## texture2ddecoder-wasm
 
-### 1.2.6 - Unreleased
+### 1.2.6 - 2026-10-16
 
 - Update repository metadata and documentation links after the GitHub repository rename to
   `fatal10110/unity-asset-reader` (#199). The npm package name stays `texture2ddecoder-wasm`.
+- README: a table of the decode function per format, a live demo link, and acknowledgements
+  (#207, #208, #209).
 
 ### 1.2.5 - 2026-09-29
 
