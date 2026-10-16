@@ -18,6 +18,7 @@ You do not need Unity, .NET, or a native application installed.
 | Load files or folders from disk | Add `unity-asset-reader-node` |
 | Export meshes as OBJ | Add `unity-asset-reader-mesh` |
 | Convert audio clips to WAV | Add `unity-asset-reader-audio` |
+| Export Spine skeletons (data, atlas, page textures) | Add `unity-asset-reader-spine` |
 | Decode raw texture blocks without reading Unity files | `texture2ddecoder-wasm` |
 
 The texture package installs `texture2ddecoder-wasm` automatically.
@@ -32,6 +33,8 @@ The texture package installs `texture2ddecoder-wasm` automatically.
   `meshToObj()`, as AssetStudio exports it.
 - **[Audio](packages/audio/README.md):** convert an `AudioClip` to a WAV file with
   `fsb5ToWav(clip.data.audioData)`, for PCM and ADPCM sound (not Vorbis).
+- **[Spine](packages/spine/README.md):** find each spine-unity skeleton's data, atlas text and
+  page textures with `spineSkeletons(env)`.
 - **[Standalone decoder](packages/decoder/README.md):** decode compressed texture blocks
   to **BGRA**. It does not read Unity files.
 
@@ -104,6 +107,7 @@ the Vite and Next.js setups.
   - [`unity-asset-reader-node`](packages/node/README.md): `loadPath()`.
   - [`unity-asset-reader-mesh`](packages/mesh/README.md): `meshToObj()`.
   - [`unity-asset-reader-audio`](packages/audio/README.md): FSB5 codecs to WAV.
+  - [`unity-asset-reader-spine`](packages/spine/README.md): `spineSkeletons()`.
 - [`examples/`](examples/README.md): a CDN page that reads a bundle in a Worker and draws its
   textures.
 
