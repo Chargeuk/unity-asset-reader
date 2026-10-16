@@ -81,7 +81,8 @@ Unity parsing uses no WASM; its compressed texture decoder does.
 Our library converts audio to WAV only, and only PCM and ADPCM clips (`unity-asset-reader-audio`):
 not Vorbis yet. It exposes raw video and font bytes and does not decode video.
 Our library exports a Mesh as Wavefront OBJ through `unity-asset-reader-mesh`'s `meshToObj()`,
-byte for byte AssetStudio's OBJ for every fixture mesh; it writes no other model format.
+byte for byte AssetStudio's OBJ for every fixture mesh, and as binary glTF 2.0 (`.glb`) through
+`meshToGltf()`; it writes no FBX.
 Exporting Spine means grouping each spine-unity skeleton's data, atlas text and page textures
 (`unity-asset-reader-spine`), from files built with type trees.
 AssetStudioMod documents Unity 1.7 to 6000.2; none of the others names Unity 6000.6. Loading
