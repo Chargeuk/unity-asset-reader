@@ -40,6 +40,55 @@ for (const [name, code] of [
   });
 }
 
+const DIM = '[["Rect", 4], ["Buffer", 5], ["SubpassData", 6]]';
+
+test("the SPIR-V Dim enum's [\"Buffer\", 5] entry passes in the shader package only (#242)", async () => {
+  const src = `export const dim = ${DIM};\n`;
+  assert.deepEqual(await checkPackage(pkg("buffer-enum", src), PACKAGES.shader), []);
+  const elsewhere = await checkPackage(pkg("buffer-enum-core", src), rules);
+  assert.match(elsewhere.join("\n"), /node-only global/);
+});
+
+test("the shader package's Dim exemption must match exactly once", async () => {
+  for (const [name, src] of [
+    ["none", "export const dim = 1;\n"],
+    ["twice", `export const a = ${DIM};\nexport const b = ${DIM};\n`],
+  ]) {
+    const problems = await checkPackage(pkg(`buffer-enum-${name}`, src), PACKAGES.shader);
+    assert.match(problems.join("\n"), /times, expected exactly 1/, name);
+  }
+});
+
+for (const [i, code] of [
+  'globalThis[["Buffer", 5][0]]',
+  "Reflect.get(globalThis, ['Buffer', 0][0])",
+  '(() => { const [n] = ["Buffer", 0]; return globalThis[n]; })()',
+].entries()) {
+  test(`a "Buffer" tuple used as a name fails, in the shader package too: ${code}`, async () => {
+    const src = `export const dim = ${DIM};\nexport const b = ${code};\n`;
+    for (const [where, r] of [["core", rules], ["shader", PACKAGES.shader]]) {
+      const problems = await checkPackage(pkg(`buffer-tuple-${i}-${where}`, src), r);
+      assert.match(problems.join("\n"), /node-only global/, `${where}: ${code}`);
+    }
+  });
+}
+
+for (const [i, code] of [
+  '"Buffer" in globalThis',
+  'Reflect.get(globalThis, "Buffer")',
+  'Object.getOwnPropertyDescriptor(globalThis, "Buffer")',
+  '(() => { const n = "Buffer"; return (globalThis as Record<string, unknown>)[n]; })()',
+  '(globalThis as Record<string, unknown>)["Buffer"]',
+  "(self as unknown as Record<string, unknown>)['Buffer']",
+  "(globalThis as Record<string, unknown>)[`Buffer`]",
+  '(globalThis as Record<string, unknown> | undefined)?.["Buffer"]',
+].entries()) {
+  test(`a "Buffer" string used as a name still fails: ${code}`, async () => {
+    const problems = await checkPackage(pkg(`buffer-string-${i}`, `export const b = ${code};\n`), rules);
+    assert.match(problems.join("\n"), /node-only global/, code);
+  });
+}
+
 test("ArrayBuffer and property names are not node globals", async () => {
   const src = "export const a = new ArrayBuffer(1);\nexport const b = ({} as Record<string, number>).process;\n";
   assert.deepEqual(await checkPackage(pkg("false-pos", src), rules), []);
