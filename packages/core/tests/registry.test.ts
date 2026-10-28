@@ -4,6 +4,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { setResourceReader, type ResourceReader } from "../src/index.js";
 
 import {
   fixtureNames,
@@ -480,3 +481,41 @@ for (const { classId, name } of NAMED) {
     }
   });
 }
+
+
+test("public synchronous resource hook resolves Texture2D from a separately owned object span", () => {
+  const name = "editor/6000.3.25f1/lz4/texture";
+  const env = loadName(name);
+  const node = env.files.find((file) => golden(name).serialized![file.path])!;
+  const file = readSerializedFile(node.data);
+  const info = file.objects.find((object) => object.classId === ClassID.Texture2D)!;
+  const bytes = node.data.slice(info.byteStart, info.byteStart + info.byteSize);
+  const reader = new ObjectReader(bytes, file, info, node.path, info.byteStart);
+  const raw = readTexture2D(reader);
+  assert.equal(raw["image data"].length, 0);
+  assert.ok(raw.m_StreamData?.path);
+  // Env resources require the original reader identity, not just its pathID.
+  // Preacquire while that context is available, then give the new reader a
+  // synchronous lookup over exactly the selected owned bytes.
+  const original = env.objects.find((object) =>
+    object.fileName === node.path && object.pathId === info.pathId)!;
+  assert.ok(original);
+  assert.notEqual(original, reader);
+  assert.equal(original.fileName, reader.fileName);
+  assert.throws(() => env.readResource(raw.m_StreamData!, reader), /was not loaded by this env/);
+  const selected = env.readResource(raw.m_StreamData!, original);
+  const owned = new Uint8Array(selected.length);
+  owned.set(selected);
+  assert.equal(owned.buffer.byteLength, raw.m_StreamData!.size);
+  let calls = 0;
+  const resources: ResourceReader = (ref, from) => {
+    assert.equal(from, reader);
+    assert.deepEqual(ref, raw.m_StreamData);
+    calls++;
+    return owned;
+  };
+  setResourceReader(reader, resources);
+  const texture = reader.read<Texture2DData>();
+  assert.equal(calls, 1);
+  assert.equal(sha256(texture.imageData), textureGoldens(name).get(String(info.pathId))!.imageSha256);
+});

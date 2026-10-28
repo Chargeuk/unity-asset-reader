@@ -1,5 +1,10 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { compress } from "lzma1";
+import { openBundleRange } from "../src/bundle/BundleRangeReader.js";
+import { ObjectReader } from "../src/serialized/ObjectReader.js";
+import type { ObjectInfo, SerializedFile } from "../src/serialized/SerializedFile.js";
+import type { BundleEntry } from "../src/bundle/BundleRangeReader.js";
 
 import {
   assertMatchesGolden,
@@ -849,4 +854,234 @@ test("reports a bundle whose signature is not a container at all", () => {
     () => readBundle(new Uint8Array(64)),
     (error: unknown) => error instanceof UnsupportedError && error.kind === "container",
   );
+});
+
+// --- selected acquisition: independent fixture goldens and owned spans ------
+
+for (const name of [...UNITYFS_FIXTURES, ...STRIPPED_FIXTURES]) {
+  test(`selected ranges of ${name} match the independent golden`, async () => {
+    const reader = await openBundleRange(new Blob([loadFixture(name)]));
+    try {
+      const files = [];
+      for (const entry of reader.entries) {
+        const bytes = await reader.readRange({ entry, offset: 0, length: entry.size });
+        assert.equal(bytes.buffer.byteLength, bytes.length, "owned bytes do not pin sibling nodes");
+        files.push({ path: entry.path, flags: entry.flags, data: bytes });
+      }
+      assertMatchesGolden(name, files);
+    } finally { reader.close(); }
+  });
+}
+
+/** Valid raw LZ4: one A literal, a long offset-one match, five final literals. */
+function repeatedLz4(size: number): Uint8Array {
+  const bytes = [0x1f, 65, 1, 0];
+  let extra = size - 1 - 5 - 4 - 15;
+  while (extra >= 255) { bytes.push(255); extra -= 255; }
+  bytes.push(extra, 0x50, 65, 65, 65, 65, 65);
+  return Uint8Array.from(bytes);
+}
+
+test("one large LZ4HC block is scanned once for ordered separated ranges with bounded ownership", async () => {
+  const size = 8 * 1024 * 1024;
+  const compressed = repeatedLz4(size);
+  const bundle = buildBundle({ blocks: [{ data: compressed, flags: 3, uncompressedSize: size }],
+    nodes: [{ path: "large", offset: 0, size }] });
+  const reads: [number, number][] = [];
+  const source = { size: bundle.length, slice(start: number, end: number) {
+    reads.push([start, end]);
+    return { async arrayBuffer() { return bundle.slice(start, end).buffer; } };
+  } };
+  const reader = await openBundleRange(source);
+  reads.length = 0;
+  try {
+    const entry = reader.entries[0]!;
+    const offsets = [1, 3 * 1024 * 1024 + 3, size - 100];
+    const received: number[] = [];
+    await reader.readRanges(offsets.map((offset) => ({ entry, offset, length: 97 })),
+      async (range, bytes, offset) => {
+        assert.equal(offset, 0);
+        assert.equal(bytes.length, 97);
+        assert.equal(bytes.buffer.byteLength, bytes.length);
+        assert.ok(bytes.every((value) => value === 65));
+        received.push(range.offset);
+        // Writing retained output must not modify the history used by later spans.
+        bytes.fill(99);
+        await new Promise((resolve) => setTimeout(resolve, 1));
+      });
+    assert.deepEqual(received, offsets);
+    assert.equal(reads.length, 1, "one compressed acquisition, rather than one inflate per range");
+    assert.ok(reads.every(([start, end]) => end - start <= 65536));
+  } finally { reader.close(); }
+});
+
+test("selected spans cross stored/LZ4/LZMA block boundaries without retaining the joined stream", async () => {
+  // Liblzma's fixed golden from lzma.test.ts: 512 bytes of the named pattern.
+  const lzma = Uint8Array.from(Buffer.from(
+    "5d00008000003a9b8962453cf15ddc94ba6c46122fe93c3fc99e5ef5d7b185414bffffeb3b0000", "hex"));
+  const bundle = buildBundle({ blocks: [
+    { data: Uint8Array.of(9, 8, 7, 6) },
+    { data: lz4Literals(Uint8Array.of(5, 4, 3, 2)), flags: 2, uncompressedSize: 4 },
+    { data: lzma, flags: 1, uncompressedSize: 512 },
+  ], nodes: [{ path: "joined", offset: 0, size: 520 }] });
+  const reader = await openBundleRange(bundle);
+  try {
+    const bytes = await reader.readRange({ entry: reader.entries[0]!, offset: 2, length: 25 });
+    assert.deepEqual([...bytes], [7, 6, 5, 4, 3, 2,
+      ...Array.from({ length: 19 }, (_, i) => "unity-asset-reader/".charCodeAt(i))]);
+  } finally { reader.close(); }
+});
+
+test("large single LZMA block selected ranges preserve exact bytes through slow consumption", async () => {
+  const size = 6 * 1024 * 1024;
+  const container = compress(new Uint8Array(size).fill(71), { dictSize: 524288 });
+  const raw = Uint8Array.from([...container.subarray(0, 5), ...container.subarray(13)]);
+  const reader = await openBundleRange(buildBundle({
+    blocks: [{ data: raw, flags: 1, uncompressedSize: size }],
+    nodes: [{ path: "large-lzma", offset: 0, size }],
+  }));
+  try {
+    const entry = reader.entries[0]!;
+    let count = 0;
+    await reader.readRanges([0, size - 131073].map((offset) => ({ entry, offset, length: 131073 })),
+      async (_range, bytes) => {
+        assert.ok(bytes.length <= 65536);
+        assert.equal(bytes.buffer.byteLength, bytes.length);
+        assert.ok(bytes.every((value) => value === 71));
+        count += bytes.length;
+        await new Promise((resolve) => setTimeout(resolve, 1));
+      });
+    assert.equal(count, 2 * 131073);
+  } finally { reader.close(); }
+});
+
+test("range entry identity, order, extents, corrupt codec and closed ownership fail explicitly", async () => {
+  const data = buildBundle();
+  const first = await openBundleRange(data);
+  const second = await openBundleRange(data);
+  const entry = first.entries[0]!;
+  try {
+    for (const bad of [
+      { entry: { ...entry }, offset: 0, length: 1 },
+      { entry: second.entries[0]!, offset: 0, length: 1 },
+      { entry, offset: -1, length: 1 },
+      { entry, offset: 0, length: NaN },
+      { entry, offset: 60, length: 5 },
+    ]) await assert.rejects(first.readRange(bad), CorruptError);
+    await assert.rejects(first.readRanges([
+      { entry, offset: 8, length: 4 }, { entry, offset: 2, length: 1 },
+    ], () => assert.fail("invalid batch must publish nothing")), /ordered/);
+    first.close();
+    await assert.rejects(first.readRange({ entry, offset: 0, length: 1 }), /closed/);
+  } finally { first.close(); second.close(); }
+  for (const malformed of [
+    buildBundle({ nodes: [{ path: "outside", offset: 1, size: 64 }] }),
+    buildBundle({ blocks: [{ data: Uint8Array.of(0, 0, 0), flags: 2, uncompressedSize: 64 }] }),
+    buildBundle({ blocks: [{ data: new Uint8Array(8), flags: 1, uncompressedSize: 64 }] }),
+  ]) {
+    let reader;
+    try {
+      reader = await openBundleRange(malformed);
+      await assert.rejects(reader.readRange({ entry: reader.entries[0]!, offset: 0, length: 64 }), CorruptError);
+    } catch (error) { assert.ok(error instanceof CorruptError); }
+    finally { reader?.close(); }
+  }
+});
+
+test("range cancellation closes stalled acquisition and never calls the consumer again", async () => {
+  const data = buildBundle({ blocks: [{ data: payload(200000) }],
+    nodes: [{ path: "large", offset: 0, size: 200000 }] });
+  const abort = new AbortController();
+  const reader = await openBundleRange(data);
+  let calls = 0;
+  try {
+    const selection = { entry: reader.entries[0]!, offset: 0, length: 200000 };
+    const reason = Object.freeze(new Error("consumer cancelled"));
+    await assert.rejects(reader.readRanges([selection], async () => {
+      calls++;
+      setTimeout(() => abort.abort(reason), 0);
+      await new Promise<void>(() => {});
+    }, abort.signal), (error: unknown) => error === reason);
+    assert.equal(calls, 1);
+    const before = new AbortController(); before.abort(reason);
+    await assert.rejects(reader.readRanges([selection], () => { calls++; }, before.signal),
+      (error: unknown) => error === reason);
+    assert.equal(calls, 1);
+  } finally { reader.close(); }
+  const closed = await openBundleRange(data);
+  await assert.rejects(closed.readRanges([
+    { entry: closed.entries[0]!, offset: 0, length: 200000 },
+  ], async () => {
+    setTimeout(() => closed.close(), 0);
+    await new Promise<void>(() => {});
+  }), /cancelled/);
+  await assert.rejects(closed.readRange({ entry: closed.entries[0]!, offset: 0, length: 1 }), /closed/);
+  const stalled = new AbortController();
+  const opened = openBundleRange({ size: data.length,
+    slice() { return { arrayBuffer: () => new Promise<ArrayBuffer>(() => {}) }; } }, stalled.signal);
+  const reason = new Error("source cancelled");
+  stalled.abort(reason);
+  await assert.rejects(opened, (error: unknown) => error === reason);
+});
+
+test("batch metadata and selected object spans retain public absolute identity and oracle values", async () => {
+  const name = "editor/2020.3.30f1/lzma/shared";
+  const reader = await openBundleRange(loadFixture(name));
+  try {
+    const files = reader.entries.filter((entry) => (entry.flags & NodeFlags.SerializedFile) !== 0);
+    const seen: string[] = [];
+    const objects: { entry: BundleEntry; file: SerializedFile; info: ObjectInfo }[] = [];
+    await reader.readMetadata(files, async (entry, file) => {
+      const expected = golden(name).serialized![entry.path]!;
+      assert.equal(file.header.fileSize, entry.size);
+      assert.equal(file.unityVersion, expected.unityVersion);
+      assert.deepEqual(file.objects.map((object) => ({ pathId: String(object.pathId),
+        classId: object.classId, byteSize: object.byteSize })).sort((a, b) =>
+        a.pathId < b.pathId ? -1 : a.pathId > b.pathId ? 1 : 0), golden(name).objects[entry.path]);
+      // Acquire bodies in a separate ordered phase; do not recursively rescan
+      // a large block from inside each metadata callback.
+      for (const info of file.objects) {
+        if (info.classId === 49) objects.push({ entry, file, info });
+      }
+      seen.push(entry.path);
+    });
+    objects.sort((a, b) => a.entry.offset + a.info.byteStart - b.entry.offset - b.info.byteStart);
+    assert.ok(objects.length > 0, "fixture contains a TextAsset with an independent name golden");
+    let owned: Uint8Array | undefined;
+    let parsed = 0;
+    await reader.readRanges(objects.map(({ entry, info }) =>
+      ({ entry, offset: info.byteStart, length: info.byteSize })), (range, chunk, offset) => {
+      const { entry, file, info } = objects.find((object) =>
+        object.entry === range.entry && object.info.byteStart === range.offset)!;
+      if (offset === 0) owned = new Uint8Array(range.length);
+      owned!.set(chunk, offset);
+      if (offset + chunk.length === range.length) {
+        const object = new ObjectReader(owned!, file, info, entry.path, info.byteStart);
+        assert.equal(object.pathId, info.pathId);
+        assert.equal(object.byteStart, info.byteStart);
+        assert.equal(object.fileName, entry.path);
+        assert.equal(object.readAlignedString(), golden(name).serialized![entry.path]!.names[String(info.pathId)]);
+        parsed++;
+        owned = undefined;
+      }
+    });
+    assert.equal(parsed, objects.length);
+    assert.equal(seen.length, files.length);
+  } finally { reader.close(); }
+});
+
+
+test("stored ranges from a Node byte-array subclass are owned rather than slice views", async () => {
+  const source = Buffer.from(buildBundle());
+  const before = Uint8Array.from(source);
+  const reader = await openBundleRange(source);
+  try {
+    await reader.readRanges([{ entry: reader.entries[0]!, offset: 8, length: 7 }],
+      (_range, bytes) => {
+        assert.equal(bytes.buffer.byteLength, 7);
+        assert.deepEqual([...bytes], [...payload(64).subarray(8, 15)]);
+        bytes.fill(255);
+      });
+    assert.deepEqual(Uint8Array.from(source), before);
+  } finally { reader.close(); }
 });

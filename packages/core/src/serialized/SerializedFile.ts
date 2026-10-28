@@ -132,49 +132,18 @@ export interface SerializedFile {
  *
  * @param data the whole SerializedFile, e.g. one of `load().files`; kept by
  *   reference, and hashes and GUIDs in the result are views into it (R7)
+ * @param declaredFileSize optional full node extent when data holds only its metadata prefix
  * @returns the header and metadata
  * @throws {UnsupportedError} for a format version outside 2 to 23
  * @throws {CorruptError} when the metadata is truncated or holds a count,
  *   offset or type index that cannot be right
  */
-export function readSerializedFile(data: Uint8Array): SerializedFile {
+export function readSerializedFile(data: Uint8Array, declaredFileSize?: number): SerializedFile {
   const reader = new BinaryReader(data, "big");
 
-  const header: SerializedFileHeader = {
-    metadataSize: reader.readUInt32(),
-    fileSize: reader.readUInt32(),
-    version: reader.readUInt32(),
-    dataOffset: reader.readUInt32(),
-    endianess: 0,
-    reserved: new Uint8Array(0),
-  };
+  const header = parseHeader(reader);
   const format = header.version;
-  if (format <= V.Unsupported || format > V.TypeTreeWithHeader) {
-    throw new UnsupportedError("SerializedFile format version", format, "expected 2 to 23");
-  }
-
-  if (format >= V.Unknown_9) {
-    header.endianess = reader.readUInt8();
-    header.reserved = reader.readBytes(3);
-  } else {
-    // Before 3.5 (format 9) the metadata, endianness byte first, sits at the end.
-    if (header.metadataSize > header.fileSize || header.fileSize > data.length) {
-      throw new CorruptError(
-        `metadata of ${header.metadataSize} bytes does not end a file of ` +
-          `${header.fileSize} bytes (${data.length} given)`,
-      );
-    }
-    reader.position = header.fileSize - header.metadataSize;
-    header.endianess = reader.readUInt8();
-  }
-
-  // 2020.1+ (format 22): 64-bit sizes follow, superseding the 32-bit ones.
-  if (format >= V.LargeFilesSupport) {
-    header.metadataSize = reader.readUInt32();
-    header.fileSize = toOffset(reader.readInt64(), "file size");
-    header.dataOffset = toOffset(reader.readInt64(), "data offset");
-    reader.readInt64(); // reserved
-  }
+  if (declaredFileSize !== undefined) validateExtent(header, declaredFileSize);
 
   // From format 9 the metadata follows the header, so a file cut inside it is
   // caught here - otherwise a cut in a trailing C string reads as a shorter
@@ -212,6 +181,17 @@ export function readSerializedFile(data: Uint8Array): SerializedFile {
   const objects: ObjectInfo[] = [];
   for (let i = 0; i < objectCount; i++) {
     objects.push(readObjectInfo(reader, format, bigIdEnabled, header.dataOffset, types));
+  }
+
+  if (declaredFileSize !== undefined) {
+    for (const object of objects) {
+      const end = object.byteStart + object.byteSize;
+      if (!Number.isSafeInteger(end) || object.byteStart < header.dataOffset ||
+          end > declaredFileSize) {
+        throw new CorruptError(`object ${object.pathId} at ${object.byteStart} + ` +
+          `${object.byteSize} exceeds declared file extent ${declaredFileSize}`);
+      }
+    }
   }
 
   const scriptTypes: LocalSerializedObjectIdentifier[] = [];
@@ -270,6 +250,69 @@ export function readSerializedFile(data: Uint8Array): SerializedFile {
     refTypes,
     userInformation,
   };
+}
+
+/** Internal format >=9 prefix acquisition seam; field parsing remains synchronous. */
+export function readSerializedFileHeader(data: Uint8Array): SerializedFileHeader {
+  const reader = new BinaryReader(data, "big");
+  reader.position = 8;
+  const format = reader.readUInt32();
+  if (format < V.Unknown_9) {
+    throw new UnsupportedError("range SerializedFile format", format,
+      "prefix acquisition requires format >=9");
+  }
+  reader.position = 0;
+  return parseHeader(reader);
+}
+
+function parseHeader(reader: BinaryReader): SerializedFileHeader {
+  const header: SerializedFileHeader = {
+    metadataSize: reader.readUInt32(),
+    fileSize: reader.readUInt32(),
+    version: reader.readUInt32(),
+    dataOffset: reader.readUInt32(),
+    endianess: 0,
+    reserved: new Uint8Array(0),
+  };
+  const format = header.version;
+  if (format <= V.Unsupported || format > V.TypeTreeWithHeader) {
+    throw new UnsupportedError("SerializedFile format version", format, "expected 2 to 23");
+  }
+
+  if (format >= V.Unknown_9) {
+    header.endianess = reader.readUInt8();
+    header.reserved = reader.readBytes(3);
+  } else {
+    // Before 3.5 (format 9) the metadata, endianness byte first, sits at the end.
+    if (header.metadataSize > header.fileSize || header.fileSize > reader.length) {
+      throw new CorruptError(
+        `metadata of ${header.metadataSize} bytes does not end a file of ` +
+          `${header.fileSize} bytes (${reader.length} given)`,
+      );
+    }
+    reader.position = header.fileSize - header.metadataSize;
+    header.endianess = reader.readUInt8();
+  }
+
+  // 2020.1+ (format 22): 64-bit sizes follow, superseding the 32-bit ones.
+  if (format >= V.LargeFilesSupport) {
+    header.metadataSize = reader.readUInt32();
+    header.fileSize = toOffset(reader.readInt64(), "file size");
+    header.dataOffset = toOffset(reader.readInt64(), "data offset");
+    reader.readInt64(); // reserved
+  }
+
+  return header;
+}
+
+function validateExtent(header: SerializedFileHeader, size: number): void {
+  const prefix = header.version >= 22 ? 48 : 20;
+  if (!Number.isSafeInteger(size) || size < 0 || header.fileSize !== size ||
+      header.version < 9 || header.dataOffset < prefix + header.metadataSize ||
+      header.dataOffset > size) {
+    throw new CorruptError(`SerializedFile format ${header.version}: declared file/metadata/data ` +
+      `extents ${header.fileSize}/${header.metadataSize}/${header.dataOffset} disagree with node ${size}`);
+  }
 }
 
 /** Read one object table entry; the per-format gates are upstream's. */

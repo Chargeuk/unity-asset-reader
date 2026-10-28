@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { RangeOperation } from "../src/bundle/rangeIO.js";
 
-import { decompressLz4 } from "../src/codec/lz4.js";
+import { decompressLz4, streamLz4 } from "../src/codec/lz4.js";
 import { CorruptError } from "../src/errors.js";
 
 const ascii = (text: string): number[] => [...text].map((c) => c.charCodeAt(0));
@@ -202,4 +203,51 @@ test("does not read or write outside the buffers it was given", () => {
   assert.deepEqual(decoded, Uint8Array.from(ascii("hello")));
   assert.equal(backing[7], 0xee);
   assert.equal(backing[14], 0xee);
+});
+
+
+test("incremental LZ4 preserves maximum-distance history, overlap, long lengths and input boundaries", async () => {
+  const literals = Uint8Array.from({ length: 65535 }, (_, i) => i % 251);
+  const matches = 70000;
+  const extension = (length: number): number[] => {
+    const bytes: number[] = [];
+    while (length >= 255) { bytes.push(255); length -= 255; }
+    return [...bytes, length];
+  };
+  const input = block(0xff, extension(literals.length - 15), literals,
+    0xff, 0xff, extension(matches - 19), TAIL_SEQ);
+  const size = literals.length + matches + TAIL.length;
+  const expected = Uint8Array.from([
+    ...Array.from({ length: literals.length + matches }, (_, i) => (i % 65535) % 251),
+    ...ascii(TAIL),
+  ]);
+  const operation = new RangeOperation();
+  const actual = new Uint8Array(size);
+  let offset = 0;
+  try {
+    await streamLz4(async (at, length) => {
+      assert.ok(length <= 65536);
+      return input.slice(at, at + length);
+    }, input.length, size, async (bytes) => {
+      assert.ok(bytes.length <= 65536);
+      actual.set(bytes, offset); offset += bytes.length;
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }, operation);
+    assert.deepEqual(actual, expected);
+    assert.equal(offset, size);
+  } finally { operation.finish(); }
+});
+
+test("incremental LZ4 refuses truncated lengths, missing offsets, invalid history and wrong output sizes", async () => {
+  for (const [input, size] of [
+    [block(0xf0, 0xff), 300], [block(0x10, 65, 1), 5],
+    [block(0x10, 65, 0, 0), 5], [block(0x10, 65, 2, 0), 5],
+    [block(0x30, 1, 2), 3], [block(0x10, 65), 2],
+  ] as const) {
+    const operation = new RangeOperation();
+    try {
+      await assert.rejects(streamLz4(async (at, n) => input.slice(at, at + n), input.length,
+        size, async () => {}, operation), CorruptError);
+    } finally { operation.finish(); }
+  }
 });

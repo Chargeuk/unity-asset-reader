@@ -36,7 +36,7 @@ export type {
 } from "./serialized/SerializedFile.js";
 export type { SerializedType, TypeTreeNode } from "./serialized/TypeTree.js";
 export { ClassID, classIdName } from "./serialized/ClassID.js";
-export { ObjectReader } from "./serialized/ObjectReader.js";
+export { ObjectReader, setResourceReader } from "./serialized/ObjectReader.js";
 export type { PPtr, PPtrResolution } from "./classes/PPtr.js";
 export { readTypeTree } from "./serialized/TypeTreeReader.js";
 export type { TypeTreeObject, TypeTreeValue } from "./serialized/TypeTreeReader.js";
@@ -53,7 +53,7 @@ export type { Texture } from "./classes/Texture.js";
 export { readTexture2D } from "./classes/Texture2D.js";
 export type { GLTextureSettings, StreamingInfo, Texture2D } from "./classes/Texture2D.js";
 export { TextureFormat } from "./classes/TextureFormat.js";
-export type { ObjectData, ObjectDataMap, Texture2DData } from "./classes/registry.js";
+export type { ObjectData, ObjectDataMap, Texture2DData, ResourceReader } from "./classes/registry.js";
 export {
   toAssetBundleFields,
   toAudioClipFields,
@@ -214,3 +214,9 @@ export type {
 } from "./classes/Mesh.js";
 export { readSpriteAtlas } from "./classes/SpriteAtlas.js";
 export type { SpriteAtlas, SpriteAtlasData, SpriteInstanceData } from "./classes/SpriteAtlas.js";
+
+export { openBundleRange } from "./bundle/BundleRangeReader.js";
+export type {
+  BundleEntry, BundleRange, BundleRangeConsumer, BundleRangeReader,
+} from "./bundle/BundleRangeReader.js";
+export type { RangeAbortSignal, SliceableBlob } from "./bundle/rangeIO.js";

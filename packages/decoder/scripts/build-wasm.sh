@@ -1,106 +1,92 @@
 #!/bin/bash
 
-# Docker build script for WebAssembly module
-# No local Emscripten installation needed - just Docker
-
+# Build with the pinned native SDK on PATH, or the pinned Docker SDK.
 set -e
 
-echo "================================"
-echo "Building WebAssembly Module"
-echo "================================"
-echo ""
-
-# Get the directory of this script
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 PROJECT_ROOT="$( cd "$SCRIPT_DIR/.." && pwd )"
 OUTPUT_DIR="$PROJECT_ROOT/wasm"
 
-# Check if Docker is installed
-if ! command -v docker &> /dev/null; then
-    echo "❌ Error: Docker is not installed!"
-    echo ""
-    echo "Please install Docker from: https://www.docker.com/get-started"
-    exit 1
+# Keep the published decoder's toolchain pin on both routes (#57).
+EMSDK_IMAGE="emscripten/emsdk:4.0.7@sha256:8acec700a48dbff5250afc1e3ee545b7c002b689043ee82c277de6481a237fd7"
+# The official 4.0.7 SDK reports 4.0.7-git with this Emscripten revision.
+EMSCRIPTEN_REVISION="8dc91db45bf96c174531006839472a3924d105aa"
+NATIVE_VERSION_PATTERN="^em(cc|\+\+) \(Emscripten[^)]*\) 4\.0\.7( \($EMSCRIPTEN_REVISION\))?$"
+NATIVE_GIT_PATTERN="^em(cc|\+\+) \(Emscripten[^)]*\) 4\.0\.7-git \($EMSCRIPTEN_REVISION\)$"
+
+RUNNER=()
+NATIVE_AVAILABLE=false
+NATIVE_CONTEXT="em++ was not found on PATH"
+if command -v em++ >/dev/null 2>&1; then
+    if VERSION_OUTPUT="$(em++ --version 2>&1)"; then
+        VERSION_LINE="${VERSION_OUTPUT%%$'\n'*}"
+        if [[ "$VERSION_LINE" =~ $NATIVE_VERSION_PATTERN || "$VERSION_LINE" =~ $NATIVE_GIT_PATTERN ]]; then
+            NATIVE_AVAILABLE=true
+        else
+            NATIVE_CONTEXT="incompatible native em++: $VERSION_LINE"
+        fi
+    else
+        NATIVE_CONTEXT="native em++ --version failed: $VERSION_OUTPUT"
+    fi
 fi
 
-echo "✓ Docker is installed"
-echo ""
+if "$NATIVE_AVAILABLE"; then
+    if ! command -v node >/dev/null 2>&1; then
+        echo "Error building decoder WASM: native em++ 4.0.7 needs node on PATH for scripts/patch-glue.mjs" >&2
+        exit 1
+    fi
+    echo "Building decoder WASM with native $VERSION_LINE"
+else
+    if ! command -v docker >/dev/null 2>&1; then
+        echo "Error building decoder WASM: $NATIVE_CONTEXT; Docker is also unavailable." >&2
+        echo "Provide native em++ 4.0.7 (4.0.7-git requires $EMSCRIPTEN_REVISION), or Docker for $EMSDK_IMAGE." >&2
+        exit 1
+    fi
+    echo "$NATIVE_CONTEXT; building decoder WASM with $EMSDK_IMAGE"
+    RUNNER=(docker run --rm -v "$PROJECT_ROOT:/project" -w /project "$EMSDK_IMAGE")
+fi
 
-# Create output directory
 mkdir -p "$OUTPUT_DIR"
-
-echo "Building with Docker..."
-echo ""
-
 cd "$PROJECT_ROOT"
 
-# Pinned, not :latest, so every build uses one toolchain (#57). 4.0.7 is the
-# emsdk that built the published 1.2.2: its v1.2.2 build is byte-identical to
-# the tarball's wasm/. The digest keeps a re-pushed tag from changing the output.
-EMSDK_IMAGE="emscripten/emsdk:4.0.7@sha256:8acec700a48dbff5250afc1e3ee545b7c002b689043ee82c277de6481a237fd7"
+# Relative paths work unchanged from the native cwd and the container's /project mount.
+# Keep one source/argument list so neither route can silently use different codec flags.
+SOURCE_DIR="texture2ddecoder/src/Texture2DDecoder"
+COMPILER_ARGS=(
+    "$SOURCE_DIR/bcn.cpp"
+    "$SOURCE_DIR/pvrtc.cpp"
+    "$SOURCE_DIR/etc.cpp"
+    "$SOURCE_DIR/atc.cpp"
+    "$SOURCE_DIR/astc.cpp"
+    "$SOURCE_DIR/crunch.cpp"
+    "$SOURCE_DIR/unitycrunch.cpp"
+    wasm_bindings.cpp
+    "-I$SOURCE_DIR"
+    -D__LITTLE_ENDIAN__=1
+    -O3
+    -s WASM=1
+    -s ALLOW_MEMORY_GROWTH=1
+    -s MODULARIZE=1
+    -s EXPORT_NAME=createModule
+    -s EXPORT_ES6=1
+    -s ENVIRONMENT=web,worker,node
+    -s FILESYSTEM=0
+    -s DISABLE_EXCEPTION_CATCHING=0
+    -s ALLOW_TABLE_GROWTH=1
+    -s 'EXPORTED_RUNTIME_METHODS=[ccall,cwrap]'
+    -s 'INCOMING_MODULE_JS_API=[locateFile]'
+    --bind
+    -std=c++17
+    -o wasm/texture2ddecoder.js
+)
 
-# Build using Docker with Emscripten
-docker run --rm \
-    -v "$PROJECT_ROOT:/project" \
-    -v "$PROJECT_ROOT/texture2ddecoder/src:/project-src" \
-    -w /project \
-    "$EMSDK_IMAGE" \
-    bash -c '
-        echo "Compiling C++ to WebAssembly..."
-        em++ \
-            /project-src/Texture2DDecoder/bcn.cpp \
-            /project-src/Texture2DDecoder/pvrtc.cpp \
-            /project-src/Texture2DDecoder/etc.cpp \
-            /project-src/Texture2DDecoder/atc.cpp \
-            /project-src/Texture2DDecoder/astc.cpp \
-            /project-src/Texture2DDecoder/crunch.cpp \
-            /project-src/Texture2DDecoder/unitycrunch.cpp \
-            /project/wasm_bindings.cpp \
-            -I/project-src/Texture2DDecoder \
-            -D__LITTLE_ENDIAN__=1 \
-            -O3 \
-            -s WASM=1 \
-            -s ALLOW_MEMORY_GROWTH=1 \
-            -s MODULARIZE=1 \
-            -s EXPORT_NAME="createModule" \
-            -s EXPORT_ES6=1 \
-            -s ENVIRONMENT=web,worker,node \
-            -s FILESYSTEM=0 \
-            -s DISABLE_EXCEPTION_CATCHING=0 \
-            -s ALLOW_TABLE_GROWTH=1 \
-            -s EXPORTED_RUNTIME_METHODS=["ccall","cwrap"] \
-            -s INCOMING_MODULE_JS_API=["locateFile"] \
-            --bind \
-            -std=c++17 \
-            -o /project/wasm/texture2ddecoder.js 2>&1 | grep -v "warning:"
-        
-        if [ ${PIPESTATUS[0]} -eq 0 ]; then
-            echo ""
-            echo "✓ Build successful!"
-        else
-            echo ""
-            echo "✗ Build failed!"
-            exit 1
-        fi
-
-        # The createRequire lookup of the glue fails in a webpack server bundle; see the
-        # script (#202). It runs in the container, with the Node.js of the emsdk image,
-        # because the files the container wrote belong to its user.
-        node /project/scripts/patch-glue.mjs
-    '
-
-if [ $? -eq 0 ]; then
-    echo ""
-    echo "Generated files:"
-    echo "  - $OUTPUT_DIR/texture2ddecoder.js"
-    echo "  - $OUTPUT_DIR/texture2ddecoder.wasm"
-    echo ""
-    echo "Next steps:"
-    echo "  npm install        # Install dependencies"
-    echo "  npm run build:ts   # Build TypeScript"
-    echo "  npm test           # Run tests"
+if "${RUNNER[@]}" em++ "${COMPILER_ARGS[@]}"; then
+    # Keep patching in the same environment as compilation (including Docker file ownership).
+    "${RUNNER[@]}" node scripts/patch-glue.mjs
 else
-    echo ""
-    echo "Build failed - see errors above"
-    exit 1
+    STATUS=$?
+    echo "Error building decoder WASM: em++ compilation failed (exit $STATUS)." >&2
+    exit "$STATUS"
 fi
+
+echo "Generated and patched $OUTPUT_DIR/texture2ddecoder.js and texture2ddecoder.wasm"

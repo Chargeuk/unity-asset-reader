@@ -153,7 +153,8 @@ export type ObjectData = ObjectDataMap[keyof ObjectDataMap] | TypeTreeObject;
 /**
  * Reads the bytes a {@link ResourceRef} names, for the object it was read
  * from: the env's `readResource`, which `load()` hands to every object it
- * builds. Internal: not exported from the package.
+ * builds. Selected-range callers may provide the same synchronous contract via
+ * setResourceReader after acquiring just the referenced resource bytes.
  */
 export type ResourceReader = (ref: ResourceRef, from: ObjectReader) => Uint8Array;
 

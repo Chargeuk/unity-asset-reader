@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { loadFixture, assertMatchesGolden } from "../../../fixtures/helpers.js";
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { createRequire } from "node:module";
@@ -40,4 +41,20 @@ test("the published tarball holds dist, LICENSE, NOTICE and README only", () => 
     files.filter((path) => path.endsWith(".tsbuildinfo") || /(?<!\.d)\.ts$/.test(path)),
     [],
   );
+});
+
+
+test("both distributions execute public LZMA range acquisition without private subpaths", async () => {
+  for (const api of [require(dist("index.cjs")), await import(dist("index.mjs"))]) {
+    assert.equal(typeof api.setResourceReader, "function");
+    const reader = await api.openBundleRange(new Blob([loadFixture("lzma.bundle")]));
+    const files = [];
+    try {
+      for (const entry of reader.entries) {
+        const data = await reader.readRange({ entry, offset: 0, length: entry.size });
+        files.push({ path: entry.path, data });
+      }
+      assertMatchesGolden("lzma.bundle", files);
+    } finally { reader.close(); }
+  }
 });

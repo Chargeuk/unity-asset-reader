@@ -292,3 +292,24 @@ test("vector helpers throw CorruptError past the end of the object", () => {
   assert.throws(() => handBuilt(floats(3), "5.3.8f2").readVector3(), CorruptError);
   assert.throws(() => handBuilt(floats(11), "2019.4.41f2").readXForm4(), CorruptError);
 });
+
+test("an owned object span preserves absolute identity, alignment, version and original bytes", () => {
+  const name = "editor/2020.3.30f1/lz4/shared";
+  const path = Object.keys(golden(name).serialized!)[0]!;
+  const data = node(name, path);
+  const file = readSerializedFile(data);
+  const info = file.objects.find((object) => object.classId === ClassID.TextAsset)!;
+  assert.ok(info);
+  const owned = data.slice(info.byteStart, info.byteStart + info.byteSize);
+  const reader = new ObjectReader(owned, file, info, path, info.byteStart);
+  assert.equal(reader.pathId, info.pathId);
+  assert.equal(reader.byteStart, info.byteStart);
+  assert.equal(reader.version, file.version);
+  assert.equal(reader.fileName, path);
+  assert.equal(reader.readAlignedString(), golden(name).serialized![path]!.names[String(info.pathId)]);
+  assert.equal(reader.length, info.byteSize);
+  for (const base of [-1, NaN, info.byteStart + 1, info.byteStart - 1]) {
+    assert.throws(() => new ObjectReader(owned, file, info, path, base), CorruptError);
+  }
+  assert.throws(() => new ObjectReader(owned.subarray(1), file, info, path, info.byteStart), CorruptError);
+});

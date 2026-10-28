@@ -1506,10 +1506,10 @@ export interface MeshFields extends NamedObjectFields {
   boneNameHashes: number[];
   /** Unity: `m_RootBoneNameHash`. */
   rootBoneNameHash: number;
-  /** Unity: `m_BonesAABB`. */
-  bonesAABB: MinMaxAABBFields[];
-  /** Unity: `m_VariableBoneCountWeights`. */
-  variableBoneCountWeights: {
+  /** Unity: `m_BonesAABB`. Unity 2019.1 and later. */
+  bonesAABB?: MinMaxAABBFields[];
+  /** Unity: `m_VariableBoneCountWeights`. Unity 2019.1 and later. */
+  variableBoneCountWeights?: {
     /** Unity: `m_Data`. */
     data: number[];
   };
@@ -1543,15 +1543,15 @@ export interface MeshFields extends NamedObjectFields {
   bakedConvexCollisionMesh: Uint8Array;
   /** Unity: `m_BakedTriangleCollisionMesh`. A view (R7). */
   bakedTriangleCollisionMesh: Uint8Array;
-  /** Unity: `m_MeshMetrics[0]`. */
-  "meshMetrics[0]": number;
-  /** Unity: `m_MeshMetrics[1]`. */
-  "meshMetrics[1]": number;
+  /** Unity: `m_MeshMetrics[0]`. Unity 2018.2 and later. */
+  "meshMetrics[0]"?: number;
+  /** Unity: `m_MeshMetrics[1]`. Unity 2018.2 and later. */
+  "meshMetrics[1]"?: number;
   /**
    * Unity: `m_StreamData`. The byte range of a resource file holding the
-   * vertex data when it is not inline (an empty `path` otherwise).
+   * vertex data when it is not inline (an empty `path` otherwise). Unity 2018.3+.
    */
-  streamData: StreamingInfo;
+  streamData?: StreamingInfo;
   /** Unity: `m_MeshLodInfo`. Unity 6000.2 and later. */
   meshLodInfo?: MeshLodInfoFields;
   /** Not a Mesh field: the vertex count (see {@link MeshData.vertexCount}). */
@@ -1566,7 +1566,7 @@ export interface MeshFields extends NamedObjectFields {
   colors?: Float32Array;
   /** Not a Mesh field: UV0 to UV7 (see {@link MeshData.uv}). */
   uv: (Float32Array | undefined)[];
-  /** Not a Mesh field: bone weights per vertex (see {@link MeshData.skin}). */
+  /** Bone weights per vertex: decoded channels, or legacy `m_Skin` (see {@link MeshData.skin}). */
   skin?: VertexBoneWeights[];
   /** Not a Mesh field: each submesh's triangles (see {@link MeshData.indices}). */
   indices: Uint32Array[];
@@ -1585,8 +1585,10 @@ export function toMeshFields(data: MeshData): MeshFields {
     bindPose: data.m_BindPose,
     boneNameHashes: data.m_BoneNameHashes,
     rootBoneNameHash: data.m_RootBoneNameHash,
-    bonesAABB: data.m_BonesAABB.map((box) => ({ min: box.m_Min, max: box.m_Max })),
-    variableBoneCountWeights: { data: data.m_VariableBoneCountWeights.m_Data },
+    bonesAABB: data.m_BonesAABB?.map((box) => ({ min: box.m_Min, max: box.m_Max })),
+    variableBoneCountWeights: data.m_VariableBoneCountWeights && {
+      data: data.m_VariableBoneCountWeights.m_Data,
+    },
     meshCompression: data.m_MeshCompression,
     isReadable: data.m_IsReadable,
     keepVertices: data.m_KeepVertices,

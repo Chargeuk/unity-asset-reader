@@ -231,7 +231,7 @@ copyright notices are kept in [`NOTICE`](NOTICE) and in each package's `NOTICE` 
 | [texture2ddecoder](https://github.com/K0lb3/texture2ddecoder) (© K0lb3) | MIT | The C++ block and Crunch decoders that `texture2ddecoder-wasm` compiles to WASM (a git submodule). |
 | Codecs inside texture2ddecoder: [Perfare's AssetStudio](https://github.com/Perfare/AssetStudio/tree/master/Texture2DDecoderNative) (ATC, BCn), [mikunyan](https://github.com/Ishotihadus/mikunyan) (ASTC, ETC, PVRTC), [FP16](https://github.com/Maratyszcza/FP16), [BinomialLLC/crunch](https://github.com/BinomialLLC/crunch), [Unity-Technologies/crunch](https://github.com/Unity-Technologies/crunch) | MIT; MIT; MIT; public domain; zlib | The block decoders, half floats, and Crunch and Unity Crunch unpacking. |
 | [fflate](https://github.com/101arrowz/fflate) | MIT | Runtime dependency of `unity-asset-reader`: gzip and zlib, synchronously. |
-| [lzma1](https://github.com/xseman/lzma1) | MIT | Runtime dependency of `unity-asset-reader`: LZMA, synchronously and without WASM. |
+| [lzma1](https://github.com/xseman/lzma1) | Apache-2.0 | External runtime dependency of `unity-asset-reader` for raw LZMA decoding; it ships its own license. Core source remains MIT. |
 | [Emscripten](https://github.com/emscripten-core/emscripten) | MIT or University of Illinois/NCSA | Compiles texture2ddecoder to the WASM module and generates its JavaScript loader (the pinned `emscripten/emsdk:4.0.7` Docker image). |
 
 Development only, not shipped: TypeScript (Apache-2.0), Rollup, esbuild and tsx (MIT) build and

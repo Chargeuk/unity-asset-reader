@@ -1,6 +1,8 @@
 // Ported from AssetStudio/Classes/Mesh.cs (MIT, © Perfare / RazTools / Razviar)
 // Ported from AssetStudio/Classes/AnimationClip.cs (MIT, © Perfare / RazTools / Razviar)
 // Ported from AssetStudio/Math/Vector3.cs (MIT, © Perfare / RazTools / Razviar)
+// Ported from UnityPy/enums/VertexFormat.py (MIT, © K0lb3)
+// Unity 2018 layout gates: AssetStudio c37af7d, Classes/Mesh.cs; format map: UnityPy 1.25.4.
 
 import { CorruptError, ResourceNotFoundError, UnsupportedError } from "../errors.js";
 import type { ObjectReader, Vector3 } from "../serialized/ObjectReader.js";
@@ -110,7 +112,7 @@ export interface MeshLodInfo {
 }
 
 /**
- * The fields of a `Mesh`, as a player build of Unity 2019.1 or later stores
+ * The fields of a `Mesh`, as a player build of Unity 2018.1 or later stores
  * them, under Unity's names: the keys, their order and their values agree
  * with `readTypeTree()` on the same object, except that `m_StreamData.offset`
  * is a `number` here.
@@ -126,8 +128,10 @@ export interface Mesh extends NamedObject {
   m_BindPose: Matrix4x4[];
   m_BoneNameHashes: number[];
   m_RootBoneNameHash: number;
-  m_BonesAABB: MinMaxAABB[];
-  m_VariableBoneCountWeights: VariableBoneCountWeights;
+  /** Unity 2019.1 and later. */
+  m_BonesAABB?: MinMaxAABB[];
+  /** Unity 2019.1 and later. */
+  m_VariableBoneCountWeights?: VariableBoneCountWeights;
   /** 0 off, 1 low, 2 medium, 3 high: whether `m_CompressedMesh` holds the mesh. */
   m_MeshCompression: number;
   m_IsReadable: boolean;
@@ -137,6 +141,17 @@ export interface Mesh extends NamedObject {
   m_IndexFormat: number;
   /** The indices of every submesh, in `m_IndexFormat`: a view into the object's bytes (R7). */
   m_IndexBuffer: Uint8Array;
+  /** Before Unity 2018.2: the serialized BoneWeights4 records, under the type tree's names. */
+  m_Skin?: {
+    "weight[0]": number;
+    "weight[1]": number;
+    "weight[2]": number;
+    "weight[3]": number;
+    "boneIndex[0]": number;
+    "boneIndex[1]": number;
+    "boneIndex[2]": number;
+    "boneIndex[3]": number;
+  }[];
   m_VertexData: VertexData;
   m_CompressedMesh: CompressedMesh;
   m_LocalAABB: AABB;
@@ -152,10 +167,12 @@ export interface Mesh extends NamedObject {
   m_BakedConvexCollisionMesh: Uint8Array;
   /** A view into the object's bytes (R7). */
   m_BakedTriangleCollisionMesh: Uint8Array;
-  "m_MeshMetrics[0]": number;
-  "m_MeshMetrics[1]": number;
-  /** Where the vertex data is when not inline: an empty `path` when it is. */
-  m_StreamData: StreamingInfo;
+  /** Unity 2018.2 and later. */
+  "m_MeshMetrics[0]"?: number;
+  /** Unity 2018.2 and later. */
+  "m_MeshMetrics[1]"?: number;
+  /** Unity 2018.3+: where the vertex data is when not inline (empty `path` otherwise). */
+  m_StreamData?: StreamingInfo;
   /** Unity 6000.2 and later. */
   m_MeshLodInfo?: MeshLodInfo;
 }
@@ -220,7 +237,7 @@ export const GfxPrimitiveType = {
  * their order. Nothing is decoded or resolved; `obj.read()` does that
  * ({@link MeshData}).
  *
- * Only the layouts of Unity 2019.1 and later are read, the supported floor.
+ * Only the layouts of Unity 2018.1 and later are read, the supported floor.
  * Upstream stops after `m_StreamData`; `m_MeshLodInfo` (6000.2+) is read here
  * so the object is consumed to its last byte, and the object must end exactly
  * there, so a layout this reader does not know is refused rather than
@@ -243,7 +260,7 @@ export const GfxPrimitiveType = {
  *
  * @param reader the object's reader, rewound first and left at its end
  * @throws {UnsupportedError} of kind `"Unity version"`, with the file's own
- *   `unityVersion` as `found`: before 2019.1, for an unknown version unless
+ *   `unityVersion` as `found`: before 2018.1, for an unknown version unless
  *   the format is 18 to 21, and in those formats when the fields after
  *   `m_Name` do not fit 2019's layout. Of kind `"build target"` for an editor
  *   file (`BuildTarget.NoTarget`), which stores editor-only fields in between
@@ -254,15 +271,15 @@ export const GfxPrimitiveType = {
  */
 export function readMesh(reader: ObjectReader): Mesh {
   const stripped = reader.version.every((part) => part === 0);
-  if (!stripped && !atLeast(reader.version, 2019, 1)) {
+  if (!stripped && !atLeast(reader.version, 2018, 1)) {
     throw new UnsupportedError(
       "Unity version",
       reader.unityVersion,
-      `object ${reader.pathId}: the Mesh reader reads Unity 2019.1 and later, the supported ` +
+      `object ${reader.pathId}: the Mesh reader reads Unity 2018.1 and later, the supported ` +
         "floor; readTypeTree() reads an older one",
     );
   }
-  const version = layoutVersion(reader, "Mesh", 2019, 1);
+  const version = layoutVersion(reader, "Mesh", 2018, 1);
   // Filled in field order, so the keys come out in the order Unity wrote them.
   const out: Partial<Mesh> & NamedObject = readNamedObject(reader);
   assumingLayout(reader, "Mesh", () => readMeshFields(reader, version, out));
@@ -277,13 +294,16 @@ function readMeshFields(reader: ObjectReader, version: UnityVersion, out: Partia
   out.m_BindPose = readArray(reader, "Mesh", "m_BindPose", readMatrix);
   out.m_BoneNameHashes = readArray(reader, "Mesh", "m_BoneNameHashes", (r) => r.readUInt32());
   out.m_RootBoneNameHash = reader.readUInt32();
-  out.m_BonesAABB = readArray(reader, "Mesh", "m_BonesAABB", (r) => ({
-    m_Min: readVector3f(r),
-    m_Max: readVector3f(r),
-  }));
-  out.m_VariableBoneCountWeights = {
-    m_Data: readArray(reader, "Mesh", "m_VariableBoneCountWeights", (r) => r.readUInt32()),
-  };
+  // 2019.1+: these fields precede compression, not the old per-vertex skin records.
+  if (atLeast(version, 2019, 1)) {
+    out.m_BonesAABB = readArray(reader, "Mesh", "m_BonesAABB", (r) => ({
+      m_Min: readVector3f(r),
+      m_Max: readVector3f(r),
+    }));
+    out.m_VariableBoneCountWeights = {
+      m_Data: readArray(reader, "Mesh", "m_VariableBoneCountWeights", (r) => r.readUInt32()),
+    };
+  }
   out.m_MeshCompression = reader.readUInt8();
   out.m_IsReadable = readBool(reader);
   out.m_KeepVertices = readBool(reader);
@@ -291,6 +311,15 @@ function readMeshFields(reader: ObjectReader, version: UnityVersion, out: Partia
   reader.align();
   out.m_IndexFormat = reader.readInt32();
   out.m_IndexBuffer = readByteArray(reader, "m_IndexBuffer");
+  // Before 2018.2, BoneWeights4 is serialized separately from VertexData.
+  if (!atLeast(version, 2018, 2)) {
+    out.m_Skin = readArray(reader, "Mesh", "m_Skin", (r) => ({
+      "weight[0]": r.readFloat32(), "weight[1]": r.readFloat32(),
+      "weight[2]": r.readFloat32(), "weight[3]": r.readFloat32(),
+      "boneIndex[0]": r.readInt32(), "boneIndex[1]": r.readInt32(),
+      "boneIndex[2]": r.readInt32(), "boneIndex[3]": r.readInt32(),
+    }));
+  }
   out.m_VertexData = readVertexData(reader, version, "Mesh");
   out.m_CompressedMesh = readCompressedMesh(reader);
   out.m_LocalAABB = { m_Center: readVector3f(reader), m_Extent: readVector3f(reader) };
@@ -305,10 +334,15 @@ function readMeshFields(reader: ObjectReader, version: UnityVersion, out: Partia
   }
   out.m_BakedConvexCollisionMesh = readByteArray(reader, "m_BakedConvexCollisionMesh");
   out.m_BakedTriangleCollisionMesh = readByteArray(reader, "m_BakedTriangleCollisionMesh");
-  out["m_MeshMetrics[0]"] = reader.readFloat32();
-  out["m_MeshMetrics[1]"] = reader.readFloat32();
-  reader.align();
-  out.m_StreamData = readStreamingInfo(reader, "Mesh", version);
+  // 2018.2 adds metrics; 2018.3 adds aligned external vertex data.
+  if (atLeast(version, 2018, 2)) {
+    out["m_MeshMetrics[0]"] = reader.readFloat32();
+    out["m_MeshMetrics[1]"] = reader.readFloat32();
+  }
+  if (atLeast(version, 2018, 3)) {
+    reader.align();
+    out.m_StreamData = readStreamingInfo(reader, "Mesh", version);
+  }
   // 6000.2+ (TPK; upstream stops before it).
   if (atLeast(version, 6000, 2)) out.m_MeshLodInfo = readMeshLodInfo(reader);
   endOfObject(reader, "Mesh");
@@ -402,7 +436,7 @@ function readBool(reader: ObjectReader): boolean {
  * @throws {ResourceNotFoundError} when the vertex data is in a resource file
  *   that is not loaded, or there are no `resources` to look in
  * @throws {UnsupportedError} for a channel in a vertex format Unity does not
- *   define (above 11), bone weights in an integer format or more than four of
+ *   define (above 12 in 2018, above 11 from 2019), bone weights in an integer format or more than four of
  *   them, bone indices in a float format, and a submesh of lines or points
  *   (upstream throws for each); and as `readMesh` does
  * @throws {CorruptError} when a vertex attribute, an index or a packed vector
@@ -418,7 +452,7 @@ export function readMeshData(
   let vertexBytes = mesh.m_VertexData.m_DataSize;
   const stream = mesh.m_StreamData;
   // Upstream reads the resource only for a mesh with vertices.
-  if (stream.path && mesh.m_VertexData.m_VertexCount > 0) {
+  if (stream?.path && mesh.m_VertexData.m_VertexCount > 0) {
     // A reader built outside `load()` has no files to look in.
     if (!resources) throw new ResourceNotFoundError(stream.path, baseName(stream.path));
     vertexBytes = resources(stream, reader);
@@ -443,9 +477,8 @@ export function readMeshData(
 }
 
 /**
- * Unity's `VertexFormat` from 2019.1, the only numbering this reader meets
- * (upstream `MeshHelper.ToVertexFormat` maps older ones onto it): the bytes of
- * one component, by format.
+ * Unity's `VertexFormat` from 2019.1, after the stored version's numbering
+ * is normalized: the bytes of one component, by format.
  */
 const FORMAT_SIZE = [
   4, // Float
@@ -494,6 +527,12 @@ class Decoder {
     private readonly reader: ObjectReader,
   ) {
     this.vertexCount = mesh.m_VertexData.m_VertexCount;
+    if (mesh.m_Skin?.length) {
+      this.skin = mesh.m_Skin.map((skin): VertexBoneWeights => ({
+        weight: [skin["weight[0]"], skin["weight[1]"], skin["weight[2]"], skin["weight[3]"]],
+        boneIndex: [skin["boneIndex[0]"], skin["boneIndex[1]"], skin["boneIndex[2]"], skin["boneIndex[3]"]],
+      }));
+    }
     this.indexBuffer = this.readIndexBuffer();
   }
 
@@ -542,11 +581,17 @@ class Decoder {
 
   /** Bytes per component of a vertex format (upstream `MeshHelper.GetFormatSize`). */
   private formatSize(format: number, chn: number): number {
-    const size = FORMAT_SIZE[format];
-    if (size === undefined) {
+    return FORMAT_SIZE[this.vertexFormat(format, chn)]!;
+  }
+
+  /** UnityPy 1.25.4 VertexFormat2017: Color=2 and UNorm8=3 both become 2019's UNorm8=2. */
+  private vertexFormat(format: number, chn: number): number {
+    // Keep m_Channels unchanged. Stripped formats 18-21 assume 2019, never 2018.
+    const normalized = this.reader.version[0] === 2018 && format >= 3 ? format - 1 : format;
+    if (FORMAT_SIZE[normalized] === undefined) {
       throw new UnsupportedError("vertex format", format, `${this.owner} channel ${chn}`);
     }
-    return size;
+    return normalized;
   }
 
   /** Upstream `ReadVertexData`, for the 2018+ channel numbering. */
@@ -560,8 +605,8 @@ class Decoder {
       if (dimension === 0) return;
       const stream = streams[channel.stream]!;
       if (((stream.channelMask >>> chn) & 1) === 0) return;
-      const format = channel.format;
-      const size = this.formatSize(format, chn);
+      const format = this.vertexFormat(channel.format, chn);
+      const size = FORMAT_SIZE[format]!;
       const start = stream.offset + channel.offset;
       const at = (v: number, d: number) => start + stream.stride * v + size * d;
       // The last component must be there before any is read (upstream's
@@ -580,7 +625,7 @@ class Decoder {
           values[v * dimension + d] = component(view, at(v, d), format, little);
         }
       }
-      this.assign(chn, dimension, format, isInt ? undefined : (values as Float32Array), values);
+      this.assign(chn, dimension, channel.format, isInt ? undefined : (values as Float32Array), values);
     });
   }
 

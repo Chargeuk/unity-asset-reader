@@ -183,12 +183,7 @@ export function readBundle(data: Uint8Array): BundleFile {
   // Unity writes bundle headers big-endian; only SerializedFile flips (M2).
   const reader = new BinaryReader(data, "big");
 
-  const base: HeaderStart = {
-    signature: reader.readStringToNull(SIGNATURE_MAX_LENGTH),
-    version: reader.readUInt32(),
-    unityVersion: reader.readStringToNull(),
-    unityRevision: reader.readStringToNull(),
-  };
+  const base = readHeaderStart(reader);
 
   // Confirmed while porting (#18): upstream has nothing to port for
   // UnityArchive. AssetStudio's switch is `case "UnityArchive": break; //TODO`
@@ -212,12 +207,42 @@ export function readBundle(data: Uint8Array): BundleFile {
     : readArchiveBundle(reader, base, legacy);
 }
 
+function readHeaderStart(reader: BinaryReader): HeaderStart {
+  return {
+    signature: reader.readStringToNull(SIGNATURE_MAX_LENGTH),
+    version: reader.readUInt32(),
+    unityVersion: reader.readStringToNull(),
+    unityRevision: reader.readStringToNull(),
+  };
+}
+
 /** The `UnityFS` layout: a flags word, a blocks info, then storage blocks. */
 function readArchiveBundle(
   reader: BinaryReader,
   base: HeaderStart,
   legacy: boolean,
 ): BundleFile {
+  const { header, version } = readArchiveHeaderFields(reader, base, legacy);
+
+  if (namesNoEditor(version) && (header.flags & ArchiveFlags.BlockInfoNeedPaddingAtStart) !== 0) {
+    return readStrippedPadded(reader, header);
+  }
+
+  const { blocks, nodes } = readBlocksInfoAndDirectory(reader, header);
+  const blocksData = readBlocks(reader, blocks);
+  return { header, files: readFiles(nodes, blocksData) };
+}
+
+/** Internal shared archive header parser; range reads never enter legacy level parsing. */
+export function readUnityFSHeader(reader: BinaryReader): BundleHeader {
+  const base = readHeaderStart(reader);
+  if (base.signature !== "UnityFS") {
+    throw new UnsupportedError("range container", base.signature, "expected UnityFS");
+  }
+  return readArchiveHeaderFields(reader, base, false).header;
+}
+
+function readArchiveHeaderFields(reader: BinaryReader, base: HeaderStart, legacy: boolean) {
   const header: BundleHeader = {
     ...base,
     size: toSize(reader.readInt64(), "bundle size"),
@@ -248,13 +273,7 @@ function readArchiveBundle(
     );
   }
 
-  if (namesNoEditor(version) && (header.flags & ArchiveFlags.BlockInfoNeedPaddingAtStart) !== 0) {
-    return readStrippedPadded(reader, header, version);
-  }
-
-  const { blocks, nodes } = readBlocksInfoAndDirectory(reader, header, version);
-  const blocksData = readBlocks(reader, blocks);
-  return { header, files: readFiles(nodes, blocksData) };
+  return { header, version };
 }
 
 /**
@@ -284,11 +303,10 @@ function readArchiveBundle(
 function readStrippedPadded(
   reader: BinaryReader,
   header: BundleHeader,
-  version: UnityVersion,
 ): BundleFile {
   let layout: { blocks: StorageBlock[]; nodes: DirectoryNode[] };
   try {
-    layout = readBlocksInfoAndDirectory(reader, header, version);
+    layout = readBlocksInfoAndDirectory(reader, header);
     let end = reader.position;
     for (const block of layout.blocks) end += block.compressedSize;
     const atTheEnd = (header.flags & ArchiveFlags.BlocksInfoAtTheEnd) !== 0;
@@ -415,37 +433,39 @@ function decompressLegacyLzma(stream: Uint8Array): Uint8Array {
 function readBlocksInfoAndDirectory(
   reader: BinaryReader,
   header: BundleHeader,
-  version: UnityVersion,
 ): { blocks: StorageBlock[]; nodes: DirectoryNode[] } {
-  // Format version 7 (Unity 2020.1+): the header is padded to 16 bytes.
-  //
-  // 2019.4.15 got the alignment fix backported (issuetracker: files within
-  // AssetBundles do not start on aligned boundaries, breaking patching on
-  // Nintendo Switch) while the format version stayed at 6, so such a header is
-  // padded too and the format version alone misses it - the blocks info would
-  // be read ~14 bytes early. AssetStudio gates on the format version only;
-  // UnityPy adds the 2019.4.15 case and that is the behaviour matched here.
-  if (header.version >= 7 || (version[0] === 2019 && !isBefore(version, 2019, 4, 15))) {
-    reader.align(16);
-  }
+  const location = unityFSInfoLocation(header, reader.position, reader.length);
+  reader.position = location.infoStart;
+  const bytes = reader.readBytes(header.compressedBlocksInfoSize);
+  reader.position = location.dataStart;
+  return parseUnityFSInfo(header, bytes);
+}
 
-  const start = reader.position;
-  let blocksInfoBytes: Uint8Array;
-  if ((header.flags & ArchiveFlags.BlocksInfoAtTheEnd) !== 0) {
-    const infoStart = reader.length - header.compressedBlocksInfoSize;
-    if (infoStart < start) {
-      throw new CorruptError(
-        `blocks info of ${header.compressedBlocksInfoSize} bytes does not fit before the ` +
-          `end of ${reader.length} bytes`,
-      );
-    }
-    reader.position = infoStart;
-    blocksInfoBytes = reader.readBytes(header.compressedBlocksInfoSize);
-    reader.position = start;
-  } else {
-    blocksInfoBytes = reader.readBytes(header.compressedBlocksInfoSize);
+/** Internal shared alignment/placement rules for contiguous and selected acquisition. */
+export function unityFSInfoLocation(header: BundleHeader, headerEnd: number, fileSize: number) {
+  const version = parseVersion(header.unityRevision);
+  const align = (n: number): number => Math.ceil(n / 16) * 16;
+  // UnityPy also applies the 2019.4.15 alignment backport at format 6;
+  // checking only format >=7 reads that editor's blocks-info too early.
+  const start = header.version >= 7 ||
+    (version[0] === 2019 && !isBefore(version, 2019, 4, 15)) ? align(headerEnd) : headerEnd;
+  const atEnd = (header.flags & ArchiveFlags.BlocksInfoAtTheEnd) !== 0;
+  const infoStart = atEnd ? fileSize - header.compressedBlocksInfoSize : start;
+  if (infoStart < start || infoStart + header.compressedBlocksInfoSize > fileSize) {
+    throw new CorruptError(`blocks info does not fit in ${fileSize} bundle bytes`);
   }
+  let dataStart = atEnd ? start : infoStart + header.compressedBlocksInfoSize;
+  // 2020.3.34 / 2021.3.2 / 2022.1.1+: 0x200 means data alignment;
+  // older editors used it for encryption, refused by the shared header parser.
+  if (!usesOldArchiveFlags(version) &&
+      (header.flags & ArchiveFlags.BlockInfoNeedPaddingAtStart) !== 0) dataStart = align(dataStart);
+  const ambiguousPadding = namesNoEditor(version) &&
+    (header.flags & ArchiveFlags.BlockInfoNeedPaddingAtStart) !== 0;
+  return { infoStart, dataStart, dataEnd: atEnd ? infoStart : fileSize, ambiguousPadding };
+}
 
+/** Internal shared blocks-info decoder and directory parser. */
+export function parseUnityFSInfo(header: BundleHeader, blocksInfoBytes: Uint8Array) {
   const info = new BinaryReader(
     decompress(
       header.flags & ArchiveFlags.CompressionTypeMask,
@@ -474,19 +494,6 @@ function readBlocksInfoAndDirectory(
       flags: info.readUInt32(),
       path: info.readStringToNull(),
     });
-  }
-
-  // 2020.3.34 / 2021.3.2 / 2022.1.1 and later: with this flag the data blocks
-  // start on a 16-byte boundary. On an older bundle the same bit is the
-  // encryption flag, which readArchiveBundle already refused, so the flag-set
-  // test here is redundant today - it is the guard UnityPy writes
-  // (`isinstance(self.dataflags, ArchiveFlags) and ...`) and it keeps the two
-  // readings apart whatever the encryption mask above is narrowed to later.
-  if (
-    !usesOldArchiveFlags(version) &&
-    (header.flags & ArchiveFlags.BlockInfoNeedPaddingAtStart) !== 0
-  ) {
-    reader.align(16);
   }
 
   return { blocks, nodes };
@@ -543,9 +550,8 @@ function readFiles(nodes: DirectoryNode[], blocksData: Uint8Array): StreamFile[]
  * declared size, not by what came back, so a codec that overshoots corrupts the
  * blocks after it and one that undershoots leaves files silently zero-filled.
  * Upstream checks the write count per codec; one check here covers every
- * branch, including codecs wired up later whose decoder does not police its own
- * output - the #13 spike found `lzma1` returns more than it was asked for on
- * truncated input and throws nothing.
+ * branch, including codecs wired up later. lzma1 0.6.1 also rejects truncated
+ * and size-mismatched streams at its raw decoder boundary.
  *
  * @param type compression id from the low six bits of the flag word
  * @param src compressed bytes

@@ -44,7 +44,8 @@ const resourceReaders = new WeakMap<ObjectReader, ResourceReader>();
 
 /**
  * Let `reader.read()` read resource files through `resources` (the env's
- * `readResource`). Internal: `load()` calls it for every object it builds.
+ * `readResource`). Range callers preacquire owned resource spans and supply a
+ * synchronous lookup here; both Mesh and Texture2D use the existing registry.
  */
 export function setResourceReader(reader: ObjectReader, resources: ResourceReader): void {
   resourceReaders.set(reader, resources);
@@ -121,18 +122,25 @@ export class ObjectReader extends BinaryReader {
    * @param info one entry of `file.objects`
    * @param fileName the name of the file `data` is, for {@link fileName}:
    *   `load()` passes the last component of its path; omit it when unknown
+   * @param baseOffset absolute file offset represented by data[0], default 0
    * @throws {CorruptError} when the object's data runs past the end of `data`
    */
-  constructor(data: Uint8Array, file: SerializedFile, info: ObjectInfo, fileName = "") {
+  constructor(data: Uint8Array, file: SerializedFile, info: ObjectInfo, fileName = "", baseOffset = 0) {
     const { pathId, byteStart, byteSize } = info;
-    const end = byteStart + byteSize;
-    if (end > data.length) {
+    const start = byteStart - baseOffset;
+    const end = start + byteSize;
+    if (!Number.isSafeInteger(baseOffset) || baseOffset < 0 ||
+        !Number.isSafeInteger(byteStart) || !Number.isSafeInteger(byteSize) ||
+        !Number.isSafeInteger(byteStart + byteSize) ||
+        !Number.isSafeInteger(start) || start < 0 || !Number.isSafeInteger(end) ||
+        byteSize < 0 || end > data.length) {
       throw new CorruptError(
-        `object ${pathId} data at ${byteStart} of ${byteSize} bytes ends at ${end}, ` +
-          `past the end of the ${data.length}-byte file`,
+        `object ${pathId} data at ${byteStart} of ${byteSize} bytes ends at ${byteStart + byteSize}, ` +
+          `past the end of the ${data.length}-byte file` +
+          (baseOffset === 0 ? "" : ` span beginning at ${baseOffset}`),
       );
     }
-    super(data.subarray(byteStart, end), file.bigEndian ? "big" : "little");
+    super(data.subarray(start, end), file.bigEndian ? "big" : "little");
     this.pathId = pathId;
     this.type = info.classId;
     this.byteStart = byteStart;

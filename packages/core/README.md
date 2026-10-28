@@ -6,9 +6,10 @@ runs the same way in browsers, Web Workers and Node.js.
 
 - **Isomorphic.** It has no `node:*` import and no DOM. Input is a `Uint8Array`, or anything
   `open()` can fetch or read (a URL, a `Response`, a `Blob`).
-- **Synchronous parsing.** `load()` returns the unpacked files straight away. Only `open()`, which
-  fetches or reads the bytes first, is `async`; nothing in the parse path is (see
-  [Run it in a Worker](#run-it-in-a-worker)).
+- **Synchronous parsing.** `load()` returns the unpacked files straight away, and metadata, object
+  and class readers remain synchronous. `open()` fetches or reads complete inputs first; the
+  separate `openBundleRange()` path acquires selected UnityFS ranges and incrementally decompresses
+  them asynchronously before calling synchronous readers (see [Bounded UnityFS reads](#bounded-unityfs-reads)).
 - **No WASM.** Its only dependencies are two small, pure-JS decompressors,
   [`fflate`](https://www.npmjs.com/package/fflate) and [`lzma1`](https://www.npmjs.com/package/lzma1).
 - **64-bit values are always `bigint`**, whatever their size (see
@@ -143,9 +144,20 @@ for (const obj of env.objects) {
   file. `obj.read()` already does that for `Texture2D`, `AudioClip` and `VideoClip`
   (`imageData`, `audioData`, `videoData`).
 
-Returned bytes are views into your input or into the decompressed blocks, never copies. A small
-view keeps its whole buffer alive, so copy it (`data.slice()`) if you want to keep a small piece
-and let the rest be garbage-collected.
+### Bounded UnityFS reads
+
+`openBundleRange(input, signal?)` reads a UnityFS directory without inflating the whole payload.
+Its immutable entries identify ranges for that reader instance. `readRanges()` consumes ordered,
+nonoverlapping selections in decoded bundle order, delivering owned chunks of at most 64 KiB to an
+awaited callback; `readRange()` returns one owned span up to 64 MiB. `readMetadata()` batches file
+headers and metadata prefixes before passing parsed files to its callback. `close()` cancels an
+active read and releases the compressed source reference. Keep the input unchanged and available
+until `close()`. This path does not change the synchronous `load()` / `Env` APIs.
+
+Bytes returned by the existing `Env` APIs are views into your input or decompressed blocks, not
+copies. A small view keeps its whole buffer alive, so copy it (`data.slice()`) if you want to keep
+a small piece and let the rest be garbage-collected. The selected-range callbacks instead receive
+owned chunks as described above.
 
 ### Loading several files
 
@@ -385,6 +397,10 @@ bundled `index.d.ts`, so your editor shows it on hover.
 |---|---|
 | `load(inputs, options?)` | Unpack one file or several and index their objects. Returns an `Env` |
 | `open(sources, options?)` | Fetch or read files (URL, `Request`, `Response`, `Blob` / `File`, bytes), then `load()` them. Returns a promise of the `Env` |
+| `openBundleRange(input, signal?)`, `BundleRangeReader`, `BundleEntry`, `BundleRange` | Read selected UnityFS ranges asynchronously before synchronous metadata/object parsing; ranges belong to the reader instance |
+| `BundleRangeConsumer` | Awaited callback for owned chunks of at most 64 KiB; its offset is relative to the requested range. Chunks delivered before a batch fails are provisional, and any retained bytes belong to the caller |
+| `RangeAbortSignal` | Structural cancellation input (`aborted`, optional `reason`, and abort-listener methods), without a DOM type dependency |
+| `SliceableBlob` | Structural source input (`size` and `slice(start, end).arrayBuffer()`) for bounded reads from a caller-owned source, without a DOM type dependency |
 | `OpenSource`, `OpenOptions` | What `open()` takes; options include `LoadOptions` and a `fetch` replacing the global one |
 | `ResponseLike`, `RequestLike`, `BlobLike`, `URLLike` | The parts of the WHATWG types `open()` uses, which `Response`, `Request`, `Blob`, `File` and `URL` fit |
 | `Env` | `files`, `objects`, `assets(...types)`, `get(path)`, `resolve(pptr, from)`, `readResource(ref, from)` |
@@ -404,6 +420,8 @@ bundled `index.d.ts`, so your editor shows it on hover.
 | `AssetDataMap` | Class name to the type of `asset.data` (`Texture2DFields`, ...), for the classes with a class reader |
 | `ObjectDataMap` | Class name to what `obj.read()` returns (`Texture2DData`, ...), under Unity's names |
 | `ObjectReader` | One object: `pathId`, `type` (class id), `byteSize`, `version`, `platform`, `read()`, `readTypeTree()`, and the binary read methods of `BinaryReader` |
+| `ResourceReader` | Synchronous `(ref: ResourceRef, from: ObjectReader) => Uint8Array` lookup for the already-acquired bytes named by a resource reference |
+| `setResourceReader(reader, resources)` | Attach that synchronous lookup to one `ObjectReader`. For selected-range reads, acquire owned resource bytes for that reader first; do not delegate to an `Env.readResource` belonging to another environment |
 | `ObjectData` | The union `obj.read()` returns |
 | `readTypeTree(reader)` | Read an object into a plain JS object by walking its type tree |
 | `TypeTreeObject`, `TypeTreeValue` | What `readTypeTree` returns; the JSDoc lists each Unity type's JS shape |
@@ -473,7 +491,8 @@ For tools that work below `load()`:
   [Tpk](https://github.com/AssetRipper/Tpk) (Tpk: MIT): indirectly, the type tree data in
   UnityPy's TPK table, which the common strings and several version gates come from.
 - [fflate](https://github.com/101arrowz/fflate) (MIT) for gzip and zlib, and
-  [lzma1](https://github.com/xseman/lzma1) (MIT) for LZMA: the two runtime dependencies.
+  [lzma1](https://github.com/xseman/lzma1) (Apache-2.0) for LZMA: an external runtime dependency;
+  its package supplies its own license. The core package remains MIT.
 
 The full list is in the [repository README](https://github.com/fatal10110/unity-asset-reader/blob/main/README.md#acknowledgements),
 and a comparison with similar npm packages in [COMPARISON.md](https://github.com/fatal10110/unity-asset-reader/blob/main/COMPARISON.md).

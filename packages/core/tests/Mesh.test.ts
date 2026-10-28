@@ -5,13 +5,18 @@
 // meshes, whose expected values are worked out here from AssetStudio's
 // formulas. The decoded vertices and indices are checked against AssetStudio
 // itself through the OBJ goldens of #239.
+// Unity 2018 synthetic layouts additionally follow AssetStudio c37af7d and the release
+// trees in AssetRipper/TypeTreeDumps InfoJson/2018.{1.9,2.0,3.0}f2.json. The analytic
+// geometry below is independently specified, never generated from this parser.
 
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
+import { setResourceReader } from "../src/index.js";
 
 import { golden, loadFixture, type GoldenNode } from "../../../fixtures/helpers.js";
-import { readMesh, type Mesh, type MeshData } from "../src/classes/Mesh.js";
+import { readMesh, readMeshData, type Mesh, type MeshData } from "../src/classes/Mesh.js";
+import { toMeshFields } from "../src/classes/fields.js";
 import { atLeast } from "../src/classes/version.js";
 import { load, type Env } from "../src/env.js";
 import { CorruptError, ResourceNotFoundError, UnsupportedError } from "../src/errors.js";
@@ -118,7 +123,10 @@ interface Packed {
 interface MeshInput {
   /** Fill the fields the decoding ignores (blend shapes, bones, LOD), to test the layout. */
   rich?: boolean;
-  subMeshes?: { firstByte: number; indexCount: number; topology: number }[];
+  subMeshes?: {
+    firstByte: number; indexCount: number; topology: number;
+    baseVertex?: number; firstVertex?: number; vertexCount?: number;
+  }[];
   indexFormat?: number;
   indexBuffer?: Uint8Array;
   vertexCount?: number;
@@ -127,6 +135,7 @@ interface MeshInput {
   compressed?: { [field: string]: Packed | undefined };
   uvInfo?: number;
   streamData?: { offset: number; size: number; path: string };
+  legacySkin?: NonNullable<MeshData["skin"]>;
 }
 
 const FLOAT_VECTORS = ["m_Vertices", "m_UV", "m_Normals", "m_Tangents"];
@@ -145,7 +154,8 @@ function pack(items: number[], bits: number): Uint8Array {
 }
 
 /**
- * A Mesh as Unity's player type tree for `unity` lays it out (TPK: 2019.1.0a10,
+ * A Mesh as AssetStudio c37af7d's stock Unity 2018 gates and Unity's player type
+ * trees lay it out (TPK: 2019.1.0a10,
  * 2020.1.0a19, 2022.1.0a15, 6000.2.0a8 and 6000.6.0a5 change it), and the
  * object `readMesh` must return for it.
  */
@@ -165,9 +175,9 @@ function meshLayout(w: Writer, unity: UnityVersion, input: MeshInput = {}): Mesh
     firstByte: w.u32(s.firstByte),
     indexCount: w.u32(s.indexCount),
     topology: w.i32(s.topology),
-    baseVertex: w.u32(n++),
-    firstVertex: w.u32(n++),
-    vertexCount: w.u32(n++),
+    baseVertex: w.u32(s.baseVertex ?? n++),
+    firstVertex: w.u32(s.firstVertex ?? n++),
+    vertexCount: w.u32(s.vertexCount ?? n++),
     localAABB: aabb(),
   }));
   out.m_Shapes = {
@@ -200,8 +210,10 @@ function meshLayout(w: Writer, unity: UnityVersion, input: MeshInput = {}): Mesh
   );
   out.m_BoneNameHashes = w.array(some(0xdeadbeef, 7), (x) => w.u32(x));
   out.m_RootBoneNameHash = w.u32(rich ? 0x8000_0001 : 0);
-  out.m_BonesAABB = w.array(some(1), () => ({ m_Min: v3(), m_Max: v3() }));
-  out.m_VariableBoneCountWeights = { m_Data: w.array(some(1, 2, 3), (x) => w.u32(x)) };
+  if (atLeast(unity, 2019, 1)) {
+    out.m_BonesAABB = w.array(some(1), () => ({ m_Min: v3(), m_Max: v3() }));
+    out.m_VariableBoneCountWeights = { m_Data: w.array(some(1, 2, 3), (x) => w.u32(x)) };
+  }
   out.m_MeshCompression = w.u8(input.compressed ? 2 : 0);
   out.m_IsReadable = w.bool(true);
   out.m_KeepVertices = w.bool(false);
@@ -211,6 +223,17 @@ function meshLayout(w: Writer, unity: UnityVersion, input: MeshInput = {}): Mesh
   out.m_IndexBuffer = byteVector(
     input.indexBuffer ?? (rich ? Uint8Array.of(1, 0, 2) : new Uint8Array()),
   );
+  if (!atLeast(unity, 2018, 2)) {
+    const skin = input.legacySkin ?? some<NonNullable<MeshData["skin"]>[number]>({
+      weight: [0.75, 0.25, 0, 0], boneIndex: [3, 5, 0, 0],
+    });
+    out.m_Skin = w.array(skin, (s) => ({
+      "weight[0]": w.f32(s.weight[0]!), "weight[1]": w.f32(s.weight[1]!),
+      "weight[2]": w.f32(s.weight[2]!), "weight[3]": w.f32(s.weight[3]!),
+      "boneIndex[0]": w.i32(s.boneIndex[0]!), "boneIndex[1]": w.i32(s.boneIndex[1]!),
+      "boneIndex[2]": w.i32(s.boneIndex[2]!), "boneIndex[3]": w.i32(s.boneIndex[3]!),
+    }));
+  }
   const channels = input.channels ?? (rich ? [[0, 0, 0, 3] as Channel] : []);
   out.m_VertexData = w.pad({
     m_VertexCount: w.u32(input.vertexCount ?? 0),
@@ -254,14 +277,19 @@ function meshLayout(w: Writer, unity: UnityVersion, input: MeshInput = {}): Mesh
   }
   out.m_BakedConvexCollisionMesh = byteVector(rich ? Uint8Array.of(1, 2, 3) : new Uint8Array());
   out.m_BakedTriangleCollisionMesh = byteVector(rich ? Uint8Array.of(4) : new Uint8Array());
-  out["m_MeshMetrics[0]"] = float();
-  out["m_MeshMetrics[1]"] = w.pad(float());
-  const stream = input.streamData ?? { offset: 0, size: 0, path: "" };
-  out.m_StreamData = {
-    offset: atLeast(unity, 2020, 1) ? w.u64n(stream.offset) : w.u32(stream.offset),
-    size: w.u32(stream.size),
-    path: w.str(stream.path),
-  };
+  if (atLeast(unity, 2018, 2)) {
+    out["m_MeshMetrics[0]"] = float();
+    out["m_MeshMetrics[1]"] = float();
+  }
+  if (atLeast(unity, 2018, 3)) {
+    w.align();
+    const stream = input.streamData ?? { offset: 0, size: 0, path: "" };
+    out.m_StreamData = {
+      offset: atLeast(unity, 2020, 1) ? w.u64n(stream.offset) : w.u32(stream.offset),
+      size: w.u32(stream.size),
+      path: w.str(stream.path),
+    };
+  }
   if (atLeast(unity, 6000, 2)) {
     out.m_MeshLodInfo = {
       m_LodSelectionCurve: { m_LodSlope: float(), m_LodBias: float() },
@@ -287,10 +315,17 @@ function handBuilt(
   unity: UnityVersion = U2020,
 ): { bytes: Uint8Array; expected: Mesh; reader: ObjectReader } {
   const { bytes, expected } = build((w) => meshLayout(w, unity, input));
-  return { bytes, expected, reader: readerOf(FROM_2020, bytes, { unity }) };
+  return {
+    bytes, expected,
+    reader: readerOf(FROM_2020, bytes, { unity, ...(unity[0] === 2018 ? { format: 17 } : {}) }),
+  };
 }
 
 const LAYOUTS: UnityVersion[] = [
+  [2018, 1, 9, 2],
+  [2018, 2, 0, 1],
+  [2018, 3, 0, 1],
+  [2018, 4, 36, 1],
   [2019, 1, 0, 1],
   [2019, 4, 41, 2],
   [2020, 1, 0, 1],
@@ -321,6 +356,9 @@ const TYPE_TREES: { name: string; unity: UnityVersion }[] = [
 
 test("each version gate: a layout read as its neighbour's is refused", () => {
   const pairs: [UnityVersion, UnityVersion][] = [
+    [[2018, 1, 9, 2], [2018, 2, 0, 1]],
+    [[2018, 2, 0, 1], [2018, 3, 0, 1]],
+    [[2018, 4, 36, 1], [2019, 1, 0, 1]],
     [[2019, 4, 41, 2], [2020, 1, 0, 1]],
     [[2020, 3, 30, 1], [2022, 1, 0, 1]],
     [[2022, 1, 0, 1], [6000, 2, 0, 1]],
@@ -344,10 +382,10 @@ test("each version gate: a layout read as its neighbour's is refused", () => {
 
 // --- refusals ---------------------------------------------------------------------------
 
-test("before Unity 2019.1: UnsupportedError(Unity version), the supported floor", () => {
+test("before Unity 2018.1: UnsupportedError(Unity version), the supported floor", () => {
   const { bytes } = build((w) => meshLayout(w, [2019, 1, 0, 1], { rich: true }));
   for (const unity of [
-    [2018, 4, 36, 1],
+    [2017, 4, 40, 1],
     [5, 6, 7, 1],
   ] as UnityVersion[]) {
     const text = unity.slice(0, 3).join(".");
@@ -357,7 +395,7 @@ test("before Unity 2019.1: UnsupportedError(Unity version), the supported floor"
       (err: unknown) =>
         versionRefusal(text)(err) &&
         (err as Error).message.includes(`object ${reader.pathId}`) &&
-        (err as Error).message.includes("2019.1 and later"),
+        (err as Error).message.includes("2018.1 and later"),
     );
   }
 });
@@ -439,7 +477,7 @@ test("a negative or oversized count throws CorruptError naming the field", () =>
 
 test("2020.1+: an m_StreamData.offset of 2^53 or above throws CorruptError", () => {
   const ok = handBuilt({ streamData: { offset: 2 ** 53 - 1, size: 4, path: "a.resS" } });
-  assert.equal(readMesh(ok.reader).m_StreamData.offset, 2 ** 53 - 1);
+  assert.equal(readMesh(ok.reader).m_StreamData!.offset, 2 ** 53 - 1);
   const { bytes } = ok;
   // The object ends with the offset (8), the size (4) and the path (4 + 8).
   new DataView(bytes.buffer).setBigUint64(bytes.length - 24, 2n ** 53n, true);
@@ -474,6 +512,162 @@ function bytesOf(...values: [string, number][]): Uint8Array {
 
 /** `count` zero bytes. */
 const zeros = (count: number): [string, number][] => new Array(count).fill(["u8", 0]);
+
+// Independent analytic triangle, not parser output or third-party game data. Layout gates
+// follow AssetStudio c37af7d Mesh.cs (stock Unity); formats follow UnityPy 1.25.4's
+// VertexFormat2017. Its edges (2,0,0) and (0,3,0) give +Z winding and unit +Z normals.
+const POINTS_2018: [number, number, number][] = [[1, 2, 3], [3, 2, 3], [1, 5, 3]];
+const TRIANGLE_2018: MeshInput = {
+  vertexCount: 3,
+  channels: [
+    [0, 0, 0, 3], // Float positions, 12 bytes.
+    [0, 12, 4, 3], // 2018 SNorm8 normals, 3 bytes.
+    [0, 0, 0, 0], // No tangents.
+    [0, 15, 2, 4], // 2018 Color, the extra enum entry removed in 2019.
+    [0, 19, 5, 2], // 2018 UNorm16 UVs, 4 bytes. Total stride 23.
+  ],
+  vertexData: bytesOf(...POINTS_2018.flatMap(([x, y, z], i): [string, number][] => [
+    ["f32", x], ["f32", y], ["f32", z],
+    ["i8", 0], ["i8", 0], ["i8", 127],
+    ["u8", 255], ["u8", 0], ["u8", 128], ["u8", 255],
+    ["u16", i === 1 ? 65535 : 0], ["u16", i === 2 ? 65535 : 0],
+  ])),
+  indexBuffer: bytesOf(["u16", 0], ["u16", 1], ["u16", 2]),
+  subMeshes: [{ firstByte: 0, indexCount: 3, topology: 0, baseVertex: 0, firstVertex: 0, vertexCount: 3 }],
+};
+const UNITY_2018: UnityVersion[] = [
+  [2018, 1, 9, 2], [2018, 2, 0, 1], [2018, 3, 0, 1], [2018, 4, 36, 1],
+];
+
+for (const unity of UNITY_2018) {
+  test(`Unity ${unity.join(".")}: typed triangle preserves positions, normals, winding and raw formats`, () => {
+    const data = handBuilt(TRIANGLE_2018, unity).reader.read<MeshData>();
+    assert.equal(data.vertexCount, 3);
+    assert.deepStrictEqual(data.vertices, Float32Array.of(1, 2, 3, 3, 2, 3, 1, 5, 3));
+    assert.deepStrictEqual(data.normals, Float32Array.of(0, 0, 1, 0, 0, 1, 0, 0, 1));
+    assert.deepStrictEqual(data.indices, [Uint32Array.of(0, 1, 2)]);
+    assert.deepStrictEqual(data.uv[0], Float32Array.of(0, 0, 1, 0, 0, 1));
+    assert.deepStrictEqual(data.colors, Float32Array.from([
+      1, 0, f(128 / 255), 1, 1, 0, f(128 / 255), 1, 1, 0, f(128 / 255), 1,
+    ]));
+    assert.equal(data.m_SubMeshes[0]!.vertexCount, 3);
+    assert.equal(data.m_SubMeshes[0]!.indexCount, 3);
+    assert.equal(data.m_VertexData.m_Channels[1]!.format, 4);
+    assert.equal(data.m_VertexData.m_Channels[3]!.format, 2);
+    const fields = toMeshFields(data);
+    assert.deepStrictEqual(fields.vertices, data.vertices);
+    assert.deepStrictEqual(fields.indices, data.indices);
+    assert.equal("bonesAABB" in fields, false);
+    assert.equal("variableBoneCountWeights" in fields, false);
+    assert.equal("m_Skin" in data, unity[1] === 1);
+    assert.equal("meshMetrics[0]" in fields, unity[1]! >= 2);
+    assert.equal("streamData" in fields, unity[1]! >= 3);
+  });
+
+  test(`Unity ${unity.join(".")}: truncated layouts and short vertex data are corrupt`, () => {
+    const { bytes } = handBuilt({ rich: true }, unity);
+    // Up to the final 3 bytes can be padding, as in the existing modern truncation tests.
+    for (let cut = 0; cut <= bytes.length - 4; cut++) {
+      assert.throws(
+        () => readMesh(readerOf(FROM_2020, bytes.subarray(0, cut), { unity, format: 17 })),
+        CorruptError, `cut ${cut}`,
+      );
+    }
+    assert.throws(() => handBuilt({
+      ...TRIANGLE_2018, vertexData: TRIANGLE_2018.vertexData!.subarray(0, 68),
+    }, unity).reader.read(), CorruptError);
+  });
+}
+
+test("2018.1: separate BoneWeights4 records are consumed and retained in typed/friendly output", () => {
+  const legacySkin: NonNullable<MeshData["skin"]> = [
+    { weight: [0.75, 0.25, 0, 0], boneIndex: [3, 5, 0, 0] },
+    { weight: [1, 0, 0, 0], boneIndex: [2, 0, 0, 0] },
+    { weight: [0.5, 0.5, 0, 0], boneIndex: [1, 4, 0, 0] },
+  ];
+  const data = handBuilt({ ...TRIANGLE_2018, legacySkin }, [2018, 1, 9, 2]).reader.read<MeshData>();
+  assert.deepStrictEqual(data.m_Skin![0], {
+    "weight[0]": 0.75, "weight[1]": 0.25, "weight[2]": 0, "weight[3]": 0,
+    "boneIndex[0]": 3, "boneIndex[1]": 5, "boneIndex[2]": 0, "boneIndex[3]": 0,
+  });
+  assert.deepStrictEqual(data.skin, legacySkin);
+  assert.deepStrictEqual(toMeshFields(data).skin, legacySkin);
+  const after = handBuilt({ ...TRIANGLE_2018, legacySkin }, [2018, 2, 0, 1]).reader.read<MeshData>();
+  assert.equal("m_Skin" in after, false);
+  assert.equal(after.skin, undefined);
+});
+
+test("2018.1: invalid legacy skin counts identify the field", () => {
+  const unity: UnityVersion = [2018, 1, 9, 2];
+  const { bytes } = handBuilt(TRIANGLE_2018, unity);
+  // Schema offset: name 8 + submeshes 52 + shapes 16 + bind/bone hashes 12 +
+  // flags 4 + index format 4 + six index bytes with count/padding 12 = 108.
+  for (const count of [-1, 0x7fff_ffff]) {
+    const corrupt = bytes.slice();
+    new DataView(corrupt.buffer).setInt32(108, count, true);
+    assert.throws(() => readerOf(FROM_2020, corrupt, { unity, format: 17 }).read(),
+      /Mesh -?\d+ m_Skin count/);
+  }
+});
+
+test("2018 Color and UNorm8 are distinct stored enums with the same normalized color values", () => {
+  const channels = TRIANGLE_2018.channels!.map((c): Channel => [...c]);
+  channels[3] = [0, 15, 3, 4];
+  const data = handBuilt({ ...TRIANGLE_2018, channels }, [2018, 2, 0, 1]).reader.read<MeshData>();
+  assert.deepStrictEqual(data.colors, Float32Array.from([
+    1, 0, f(128 / 255), 1, 1, 0, f(128 / 255), 1, 1, 0, f(128 / 255), 1,
+  ]));
+  assert.equal(data.m_VertexData.m_Channels[3]!.format, 3);
+});
+
+test("2018 rejects undefined format 13, preserving the stored enum and object context", () => {
+  const channels: Channel[] = [[0, 0, 13, 3]];
+  assert.throws(() => handBuilt({ ...TRIANGLE_2018, channels }, [2018, 1, 9, 2]).reader.read(),
+    (error: unknown) => error instanceof UnsupportedError && error.kind === "vertex format" &&
+      error.found === 13 && /Mesh -?\d+ channel 0/.test(error.message));
+});
+
+test("2018 accepts SInt32 format 12 as integer bone indices rather than rejecting the valid upper enum", () => {
+  const channels = new Array<Channel>(14).fill([0, 0, 0, 0]);
+  channels[13] = [0, 0, 12, 1];
+  const data = handBuilt({
+    vertexCount: 2, channels, vertexData: bytesOf(["u32", 3], ["u32", 4]),
+  }, [2018, 2, 0, 1]).reader.read<MeshData>();
+  assert.deepStrictEqual(data.skin, [
+    { weight: [0, 0, 0, 0], boneIndex: [3, 0, 0, 0] },
+    { weight: [0, 0, 0, 0], boneIndex: [4, 0, 0, 0] },
+  ]);
+  assert.equal(data.m_VertexData.m_Channels[13]!.format, 12);
+});
+
+test("2018.3: typed vertex decoding uses exactly the selected external resource range", () => {
+  const streamData = { offset: 16, size: TRIANGLE_2018.vertexData!.length, path: "mesh.resS" };
+  const input = { ...TRIANGLE_2018, vertexData: new Uint8Array(), streamData };
+  const { reader } = handBuilt(input, [2018, 3, 0, 1]);
+  const resource = new Uint8Array(16 + streamData.size + 7);
+  resource.set(TRIANGLE_2018.vertexData!, 16);
+  let calls = 0;
+  setResourceReader(reader, (ref, from) => {
+    calls += 1;
+    assert.deepStrictEqual(ref, streamData);
+    assert.equal(from, reader);
+    return resource.subarray(ref.offset, ref.offset + ref.size);
+  });
+  const data = reader.read<MeshData>();
+  assert.equal(calls, 1);
+  assert.equal(data.m_VertexData.m_DataSize.length, 0);
+  assert.deepStrictEqual(data.vertices, Float32Array.of(1, 2, 3, 3, 2, 3, 1, 5, 3));
+  assert.deepStrictEqual(data.normals, Float32Array.of(0, 0, 1, 0, 0, 1, 0, 0, 1));
+  assert.deepStrictEqual(data.indices, [Uint32Array.of(0, 1, 2)]);
+  assert.throws(() => handBuilt(input, [2018, 3, 0, 1]).reader.read(), ResourceNotFoundError);
+});
+
+test("stripped format 17 remains ambiguous even when the bytes resemble a 2018 Mesh", () => {
+  const { bytes } = handBuilt(TRIANGLE_2018, [2018, 1, 9, 2]);
+  assert.throws(() => readerOf(FROM_2020, bytes, {
+    unity: [0, 0, 0, 0], text: "0.0.0", format: 17,
+  }).read(), versionRefusal("0.0.0"));
+});
 
 /**
  * Two vertices in three streams, a channel in each of the 2019+ formats the
@@ -526,37 +720,44 @@ const STREAMS: MeshInput = {
   subMeshes: [{ firstByte: 0, indexCount: 3, topology: 0 }],
 };
 
-test("vertex streams: every format converted as upstream's MeshHelper does", () => {
-  const { reader } = handBuilt(STREAMS);
-  assert.equal(STREAMS.vertexData!.length, 120);
-  const data = reader.read<MeshData>();
-  assert.equal(data.vertexCount, 2);
-  assert.deepStrictEqual(data.vertices, Float32Array.of(1.5, -2, 3.25, 4, 5, 6));
-  // Float16: exact, subnormals, signed zero and infinity included.
-  assert.deepStrictEqual(data.normals, Float32Array.of(1, -2, 0.5, 2 ** -24, -0, Infinity));
-  // SNorm16: x / 32767 in float32, clamped to -1.
-  assert.deepStrictEqual(
-    data.tangents,
-    Float32Array.of(1, -1, 0, f(16384 / 32767), f(-16384 / 32767), f(1 / 32767), f(-1 / 32767), -1),
-  );
-  // UNorm8: x / 255.
-  assert.deepStrictEqual(
-    data.colors,
-    Float32Array.from([255, 0, 128, 51, 1, 2, 3, 4], (x) => f(x / 255)),
-  );
-  // SNorm8 for UV0, UNorm16 for UV1; UV3 is in an integer format, so absent as upstream's null.
-  assert.deepStrictEqual(data.uv[0], Float32Array.of(1, -1, f(-64 / 127), f(64 / 127)));
-  assert.deepStrictEqual(data.uv[1], Float32Array.of(1, 0, f(32768 / 65535), f(1 / 65535)));
-  assert.deepStrictEqual(data.uv.slice(2), new Array(6).fill(undefined));
-  // Upstream reads UInt16 bone indices as Int16: 65535 is -1.
-  assert.deepStrictEqual(data.skin, [
-    { weight: [0.75, 0.25, 0, 0], boneIndex: [3, -1, 0, 0] },
-    { weight: [1, 0, 0, 0], boneIndex: [0, 7, 0, 0] },
-  ]);
-  assert.deepStrictEqual(data.indices, [Uint32Array.of(0, 1, 1)]);
-  // The type tree's dimension byte is kept as the file holds it.
-  assert.equal(data.m_VertexData.m_Channels[0]!.dimension, 0x23);
-});
+for (const unity of [[2018, 2, 0, 1], U2020] as UnityVersion[]) {
+  test(`Unity ${unity.join(".")}: vertex streams converted as upstream's MeshHelper does`, () => {
+    const input = unity[0] === 2018 ? {
+      ...STREAMS,
+      channels: STREAMS.channels!.map(([stream, offset, format, dimension]): Channel =>
+        [stream, offset, format >= 2 ? format + 1 : format, dimension]),
+    } : STREAMS;
+    const { reader } = handBuilt(input, unity);
+    assert.equal(STREAMS.vertexData!.length, 120);
+    const data = reader.read<MeshData>();
+    assert.equal(data.vertexCount, 2);
+    assert.deepStrictEqual(data.vertices, Float32Array.of(1.5, -2, 3.25, 4, 5, 6));
+    // Float16: exact, subnormals, signed zero and infinity included.
+    assert.deepStrictEqual(data.normals, Float32Array.of(1, -2, 0.5, 2 ** -24, -0, Infinity));
+    // SNorm16: x / 32767 in float32, clamped to -1.
+    assert.deepStrictEqual(
+      data.tangents,
+      Float32Array.of(1, -1, 0, f(16384 / 32767), f(-16384 / 32767), f(1 / 32767), f(-1 / 32767), -1),
+    );
+    // UNorm8: x / 255.
+    assert.deepStrictEqual(
+      data.colors,
+      Float32Array.from([255, 0, 128, 51, 1, 2, 3, 4], (x) => f(x / 255)),
+    );
+    // SNorm8 for UV0, UNorm16 for UV1; UV3 is in an integer format, so absent as upstream's null.
+    assert.deepStrictEqual(data.uv[0], Float32Array.of(1, -1, f(-64 / 127), f(64 / 127)));
+    assert.deepStrictEqual(data.uv[1], Float32Array.of(1, 0, f(32768 / 65535), f(1 / 65535)));
+    assert.deepStrictEqual(data.uv.slice(2), new Array(6).fill(undefined));
+    // Upstream reads UInt16 bone indices as Int16: 65535 is -1.
+    assert.deepStrictEqual(data.skin, [
+      { weight: [0.75, 0.25, 0, 0], boneIndex: [3, -1, 0, 0] },
+      { weight: [1, 0, 0, 0], boneIndex: [0, 7, 0, 0] },
+    ]);
+    assert.deepStrictEqual(data.indices, [Uint32Array.of(0, 1, 1)]);
+    // The type tree's dimension byte is kept as the file holds it.
+    assert.equal(data.m_VertexData.m_Channels[0]!.dimension, 0x23);
+  });
+}
 
 /** STREAMS with channel `chn` replaced. */
 function streamsWith(chn: number, channel: Channel): MeshInput {
@@ -716,22 +917,24 @@ const COMPRESSED: MeshInput = {
   ],
 };
 
-test("compressed mesh: every packed vector unpacked as upstream's DecompressCompressedMesh", () => {
-  const data = handBuilt(COMPRESSED).reader.read<MeshData>();
-  assert.equal(data.vertexCount, 2);
-  assert.deepStrictEqual(data.vertices, Float32Array.of(-1, 6, 4, 0, 2, 5));
-  assert.deepStrictEqual(data.uv[0], Float32Array.of(0, 1, 2, 3));
-  assert.deepStrictEqual(data.uv[1], Float32Array.of(3, 2, 1, 0));
-  const inverse = f(1 / f(Math.sqrt(2)));
-  assert.deepStrictEqual(data.normals, Float32Array.of(0, 0, -1, inverse, inverse, 0));
-  assert.deepStrictEqual(data.tangents, Float32Array.of(0, 0, 1, -1, 1, 0, -0, 1));
-  assert.deepStrictEqual(data.colors, Float32Array.of(3, 0, 1, 2, 2, 2, 2, 3));
-  assert.deepStrictEqual(data.skin, [
-    { weight: [1, 0, 0, 0], boneIndex: [2, 0, 0, 0] },
-    { weight: [f(10 / 31), f(10 / 31), f(5 / 31), f(6 / 31)], boneIndex: [1, 3, 4, 15] },
-  ]);
-  assert.deepStrictEqual(data.indices, [Uint32Array.of(0, 1, 2), Uint32Array.of(2, 1, 0)]);
-});
+for (const unity of [[2018, 1, 9, 2], [2018, 3, 0, 1], U2020] as UnityVersion[]) {
+  test(`Unity ${unity.join(".")}: compressed mesh decoded as upstream's DecompressCompressedMesh`, () => {
+    const data = handBuilt(COMPRESSED, unity).reader.read<MeshData>();
+    assert.equal(data.vertexCount, 2);
+    assert.deepStrictEqual(data.vertices, Float32Array.of(-1, 6, 4, 0, 2, 5));
+    assert.deepStrictEqual(data.uv[0], Float32Array.of(0, 1, 2, 3));
+    assert.deepStrictEqual(data.uv[1], Float32Array.of(3, 2, 1, 0));
+    const inverse = f(1 / f(Math.sqrt(2)));
+    assert.deepStrictEqual(data.normals, Float32Array.of(0, 0, -1, inverse, inverse, 0));
+    assert.deepStrictEqual(data.tangents, Float32Array.of(0, 0, 1, -1, 1, 0, -0, 1));
+    assert.deepStrictEqual(data.colors, Float32Array.of(3, 0, 1, 2, 2, 2, 2, 3));
+    assert.deepStrictEqual(data.skin, [
+      { weight: [1, 0, 0, 0], boneIndex: [2, 0, 0, 0] },
+      { weight: [f(10 / 31), f(10 / 31), f(5 / 31), f(6 / 31)], boneIndex: [1, 3, 4, 15] },
+    ]);
+    assert.deepStrictEqual(data.indices, [Uint32Array.of(0, 1, 2), Uint32Array.of(2, 1, 0)]);
+  });
+}
 
 test("compressed mesh: m_UVInfo lays out the UV channels and their dimensions", () => {
   // UV0 of dimension 1 (bits 0b100), UV2 of dimension 3 (0b110, the third nibble).
@@ -888,7 +1091,7 @@ test("m_StreamData: the vertex data is read from the .resS it names", () => {
 test("m_StreamData: a .resS not loaded throws ResourceNotFoundError, unless no vertices", () => {
   const { cab } = streamedFixture();
   const obj = meshOf(load([{ name: cab.path, data: cab.data }]));
-  const { path } = readMesh(obj).m_StreamData;
+  const { path } = readMesh(obj).m_StreamData!;
   assert.ok(path.endsWith("CAB-mesh.resS"));
   assert.throws(
     () => obj.read(),
@@ -950,7 +1153,7 @@ const typeTreeNodes = (nodes: GoldenNode[]): TypeTreeNode[] =>
     refTypeHash: 0n,
   }));
 
-test("TPK has a Mesh tree at every gate this reader knows, from 2019.1 to 6000.6", () => {
+test("TPK retains the modern Mesh layout trees from 2019.1 to 6000.6", () => {
   const versions = ["2019.1a10", "2020.1a19", "2022.1a15", "6000.2a8", "6000.6a5"];
   assert.deepEqual(Object.keys(TPK), versions);
 });

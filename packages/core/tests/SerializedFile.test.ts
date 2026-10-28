@@ -410,3 +410,33 @@ test("format 6 names no build type until setUnityVersion gives it one", () => {
   setUnityVersion(sf, "5.4.1p3");
   assert.equal(sf.buildType, "p");
 });
+
+/** Independently specified format-17 metadata, with one four-byte object. */
+function prefix17(relativeStart = 0, objectSize = 4): { bytes: Uint8Array; size: number } {
+  const metadata = new Writer(true);
+  metadata.str("2018.1.9f2").i32(BuildTarget.StandaloneWindows).u8(0);
+  metadata.i32(1).i32(49).u8(0).i16(-1).raw(new Uint8Array(16));
+  metadata.i32(1).align();
+  metadata.i64(7n).u32(relativeStart).u32(objectSize).i32(0);
+  metadata.i32(0).i32(0).str(""); // scripts, externals, user information
+  const dataOffset = Math.ceil((20 + metadata.length) / 16) * 16;
+  const size = dataOffset + 4;
+  const header = new Writer(false).u32(metadata.length).u32(size).u32(17).u32(dataOffset)
+    .raw([0, 0, 0, 0]);
+  return { bytes: new Uint8Array([...header.done(), ...metadata.done()]), size };
+}
+
+test("selected metadata prefixes validate the complete file/data/object extents before object reads", () => {
+  const good = prefix17();
+  const file = readSerializedFile(good.bytes, good.size);
+  assert.equal(file.objects[0]!.pathId, 7n);
+  assert.equal(file.objects[0]!.byteStart, good.size - 4);
+  assert.throws(() => readSerializedFile(good.bytes, good.size + 1), CorruptError);
+  assert.throws(() => readSerializedFile(good.bytes.subarray(0, -1), good.size), CorruptError);
+  for (const bad of [prefix17(1), prefix17(0, 5), prefix17(0xffffffff, 4)]) {
+    assert.throws(() => readSerializedFile(bad.bytes, bad.size), /object 7.*extent/);
+  }
+  const overlap = good.bytes.slice();
+  new DataView(overlap.buffer).setUint32(12, 20, false);
+  assert.throws(() => readSerializedFile(overlap, good.size), /extents/);
+});
