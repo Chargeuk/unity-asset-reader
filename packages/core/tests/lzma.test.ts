@@ -313,21 +313,109 @@ test("48 MiB one-block expansion bounds native queues and releases completed wai
   const script = `
 import assert from 'node:assert/strict';
 const Native = globalThis.TransformStream;
+const nativeTimeout = globalThis.setTimeout;
+let current, inYield=false;
+const timings=[];
+// Observe only timers synchronously scheduled by the real yield method. Keep
+// its cadence, native timer, stream pressure and cancellation path unchanged.
+globalThis.setTimeout=(callback,delay,...args)=>{
+  const owner=inYield?current:undefined, began=performance.now();
+  if(owner) owner.yieldTimers++;
+  return nativeTimeout(()=>{
+    if(owner) owner.yieldTimerWaitMs+=performance.now()-began;
+    callback(...args);
+  },delay);
+};
+function observeOperation(operation) {
+  const yieldTask=operation.yield.bind(operation);
+  operation.yield=()=>{
+    if(current) current.yieldCalls++;
+    inYield=true;
+    try {return yieldTask();} finally {inYield=false;}
+  };
+}
+async function measure(label,inputBytes,outputBytes,consumer,work) {
+  const record={label,inputBytes,expectedOutputBytes:outputBytes,consumer,context:'isolated Node child',
+    runtime:process.version,dependency:'lzma1@0.6.1',dictSize:524288,
+    source:'in-memory .lzma fixture; encoding excluded',observerOverhead:'included, not independently measured',
+    accounting:'overlapping elapsed aggregates; do not sum or label waits as CPU',
+    transformCalls:0,transformMs:0,flushMs:0,writeCalls:0,writeBytes:0,writeWaitMs:0,
+    readWaitMs:0,readBytes:0,sourceCalls:0,sourceMs:0,consumerCalls:0,consumerMs:0,
+    yieldCalls:0,yieldTimers:0,yieldTimerWaitMs:0,peakQueuedBytes:0};
+  current=record;
+  const began=performance.now(), cpu=process.cpuUsage();
+  const snapshot=outcome=>({...record,outcome,wallMs:performance.now()-began,
+    // Process CPU includes validation/observers too; transformMs is synchronous
+    // wall time (including native enqueue/copies), not an exclusive CPU clock.
+    processCpuMicroseconds:process.cpuUsage(cpu)});
+  const heartbeat=setInterval(()=>console.error('UnityLzmaAttribution '+JSON.stringify(snapshot('running'))),5000);
+  let outcome='error';
+  try {await work();outcome='success';}
+  finally {
+    clearInterval(heartbeat);
+    const result=snapshot(outcome);
+    timings.push(result);
+    console.error('UnityLzmaAttribution '+JSON.stringify(result));
+    current=undefined;
+  }
+}
+async function source(bytes,at,n) {
+  const began=performance.now();
+  try {return bytes.subarray(13+at,13+at+n);}
+  finally {current.sourceCalls++;current.sourceMs+=performance.now()-began;}
+}
+async function consume(work) {
+  const owner=current, began=performance.now();
+  owner.consumerCalls++;
+  try {await work();} finally {owner.consumerMs+=performance.now()-began;}
+}
 let queued=0, peak=0, enqueues=0;
 globalThis.TransformStream=class extends Native {
   constructor(transformer) {
     const wrapped={...transformer,start(controller) {
       transformer.start({enqueue(bytes) {
         queued+=bytes.length; peak=Math.max(peak,queued); enqueues++;
+        if(current) current.peakQueuedBytes=Math.max(current.peakQueuedBytes,queued);
         controller.enqueue(bytes);
       }});
+    },transform(chunk,controller) {
+      const owner=current, began=performance.now();
+      owner.transformCalls++;
+      try {return transformer.transform(chunk,controller);}
+      finally {owner.transformMs+=performance.now()-began;}
+    },flush(controller) {
+      const owner=current, began=performance.now();
+      try {return transformer.flush(controller);}
+      finally {owner.flushMs+=performance.now()-began;}
     }};
     super(wrapped);
     const get=this.readable.getReader.bind(this.readable);
     this.readable.getReader=(...args)=>{
       const reader=get(...args), read=reader.read.bind(reader);
-      reader.read=async()=>{const result=await read();if(!result.done)queued-=result.value.length;return result;};
+      reader.read=async()=>{
+        const owner=current, began=performance.now();
+        try {
+          const result=await read();
+          if(!result.done) {queued-=result.value.length;owner.readBytes+=result.value.length;}
+          return result;
+        }
+        finally {owner.readWaitMs+=performance.now()-began;}
+      };
       return reader;
+    };
+    const getWriter=this.writable.getWriter.bind(this.writable);
+    this.writable.getWriter=(...args)=>{
+      const writer=getWriter(...args), write=writer.write.bind(writer);
+      writer.write=chunk=>{
+        const owner=current, began=performance.now();
+        owner.writeCalls++;owner.writeBytes+=chunk.length;
+        const pending=write(chunk);
+        const settled=()=>{owner.writeWaitMs+=performance.now()-began;};
+        // Observe settlement without replacing the native write promise.
+        void pending.then(settled,settled);
+        return pending;
+      };
+      return writer;
     };
   }
 };
@@ -376,16 +464,19 @@ try {
   await manySmallWaits();
   waitRetained=await collectReleased(completedWaits,2*16384);
   operation.check();
-  await streamLzma(bytes.subarray(0,5),async(at,n)=>bytes.subarray(13+at,13+at+n),bytes.length-13,${size},async(chunk)=>{
-    assert.ok(chunk.every(value=>value===65)); total+=chunk.length;
-    completedOutput.push(new WeakRef(chunk.buffer));
-    maximumCurrent=Math.max(maximumCurrent,chunk.length);
-    const before=enqueues;
-    await new Promise(resolve=>setTimeout(resolve,1));
-    // A consumer may hold the preceding chunk while one bounded write runs.
-    assert.ok(queued<=2*512*273*(16+64+1)+524288);
-    assert.ok(enqueues>=before);
-  },operation);
+  observeOperation(operation);
+  await measure('48 MiB repeated A',bytes.length-13,${size},'byte validation plus deliberate 1 ms pacing',async()=>{
+    await streamLzma(bytes.subarray(0,5),(at,n)=>source(bytes,at,n),bytes.length-13,${size},chunk=>consume(async()=>{
+      assert.ok(chunk.every(value=>value===65)); total+=chunk.length;
+      completedOutput.push(new WeakRef(chunk.buffer));
+      maximumCurrent=Math.max(maximumCurrent,chunk.length);
+      const before=enqueues;
+      await new Promise(resolve=>setTimeout(resolve,1));
+      // A consumer may hold the preceding chunk while one bounded write runs.
+      assert.ok(queued<=2*512*273*(16+64+1)+524288);
+      assert.ok(enqueues>=before);
+    }),operation);
+  });
   assert.equal(total,${size}); assert.equal(queued,0); assert.ok(peak>0);
   assert.ok(peak+maximumCurrent<=2*512*273*(16+64+1)+2*524288);
   // Allow only a constant number of dictionary/current-chunk-sized buffers,
@@ -393,15 +484,63 @@ try {
   outputRetained=await collectReleased(completedOutput,2*524288+maximumCurrent);
   operation.check();
   assert.equal(globalThis.retainedRangeOperation,operation);
-  console.log(JSON.stringify({total,peak,maximumCurrent,waitRetained,outputRetained}));
-} finally {operation.finish();delete globalThis.retainedRangeOperation;}
+  // The expansion fixture has very few compressed writes. This bounded input
+  // exercises write/yield scheduling; both byte expectations come from the
+  // stated xorshift sequence, never from decoder output. It is not a corpus
+  // workload. Fixture encoding is outside the measured interval, in this child
+  // so no large base64 payload or commercial asset is passed through argv.
+  const {compress}=await import('lzma1');
+  let state=0x6601;
+  const schedulingInput=Uint8Array.from({length:256*1024},()=>{
+    state^=state<<13;state^=state>>>17;state^=state<<5;
+    return state&255;
+  });
+  const schedulingBytes=compress(schedulingInput,{dictSize:524288});
+  assert.ok(schedulingBytes.length>schedulingInput.length/2,
+    'scheduling fixture must exercise compressed input, not just expansion');
+  const schedulingOperation=new RangeOperation();
+  observeOperation(schedulingOperation);
+  let expectedState=0x6601, schedulingTotal=0;
+  try {
+    await measure('256 KiB xorshift seed 0x6601',schedulingBytes.length-13,schedulingInput.length,'independent byte validation; no deliberate delay',async()=>{
+      await streamLzma(schedulingBytes.subarray(0,5),(at,n)=>source(schedulingBytes,at,n),schedulingBytes.length-13,schedulingInput.length,chunk=>consume(async()=>{
+        for(const value of chunk) {
+          expectedState^=expectedState<<13;expectedState^=expectedState>>>17;expectedState^=expectedState<<5;
+          assert.equal(value,expectedState&255);
+          schedulingTotal++;
+        }
+      }),schedulingOperation);
+    });
+    assert.equal(schedulingTotal,schedulingInput.length);
+    assert.equal(queued,0);
+    for(const record of timings) {
+      assert.equal(record.writeBytes,record.inputBytes);
+      assert.equal(record.readBytes,record.expectedOutputBytes);
+      assert.equal(record.writeCalls,Math.ceil(record.inputBytes/16));
+      assert.equal(record.transformCalls,record.writeCalls);
+      assert.equal(record.yieldTimers,Math.floor(record.yieldCalls/64));
+      assert.ok(record.peakQueuedBytes<=2*512*273*(16+64+1)+524288);
+      for(const [key,value] of Object.entries(record)) {
+        if(key.endsWith('Ms')) assert.ok(Number.isFinite(value)&&value>=0,key);
+      }
+    }
+    console.log(JSON.stringify({total,peak,maximumCurrent,waitRetained,outputRetained,timings}));
+  } finally {schedulingOperation.finish();}
+} finally {
+  operation.finish();delete globalThis.retainedRangeOperation;
+  globalThis.TransformStream=Native;globalThis.setTimeout=nativeTimeout;
+}
 `;
   const result = spawnSync(process.execPath, ["--expose-gc", "--unhandled-rejections=strict", "--import", "tsx", "--input-type=module", "-e", script], {
     encoding: "utf8", timeout: 120000,
   });
-  assert.equal(result.status, 0, result.stderr || String(result.error));
+  assert.equal(result.status, 0, [result.stderr, result.stdout, String(result.error)].join("\n"));
   const measured = JSON.parse(result.stdout);
   assert.equal(measured.total, size);
   assert.ok(measured.waitRetained <= 2 * 16384);
   assert.ok(measured.outputRetained <= 2 * 524288 + measured.maximumCurrent);
+  assert.equal(measured.timings.length, 2);
+  // Preserve bounded partial records on a child timeout, and expose completed
+  // aggregates through the existing test output without creating a trace file.
+  console.log(result.stderr);
 });
