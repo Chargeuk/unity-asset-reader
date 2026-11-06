@@ -45,10 +45,28 @@ export type BundleRangeConsumer = (
   range: BundleRange, bytes: Uint8Array, offset: number,
 ) => void | Promise<void>;
 
+/** Cumulative acquisition counters, not retained byte buffers or a trace.
+ * Codec counts are actual payload invocations, including failed attempts.
+ * Bytes decoded include gaps; bytes delivered count only selected owned output.
+ */
+export interface BundleRangeDiagnostics {
+  readonly blocksInfoDecodes: number;
+  readonly rangeBatches: number;
+  readonly ranges: number;
+  /** Requested payload bytes; a failing final read may not have completed. */
+  readonly compressedBytesRequested: number;
+  readonly decodedBytes: number;
+  readonly deliveredBytes: number;
+  readonly lz4Decodes: number;
+  readonly lzmaDecodes: number;
+}
+
 /** Selected UnityFS acquisition. Parsing of the resulting bytes stays synchronous. */
 export interface BundleRangeReader {
   readonly header: Readonly<BundleHeader>;
   readonly entries: readonly BundleEntry[];
+  /** Immutable snapshot for caller-owned timing/progress; contains numbers only. */
+  readonly diagnostics?: Readonly<BundleRangeDiagnostics>;
   /**
    * Consume nonoverlapping spans in uncompressed bundle order. Each intersecting
    * block is decoded once per batch, including gaps between selected spans.
@@ -99,6 +117,8 @@ export async function openBundleRange(
   input = new Uint8Array(0);
   const operation = new RangeOperation(signal);
   let active: RangeOperation | undefined;
+  const diagnostics = { blocksInfoDecodes: 0, rangeBatches: 0, ranges: 0, compressedBytesRequested: 0,
+    decodedBytes: 0, deliveredBytes: 0, lz4Decodes: 0, lzmaDecodes: 0 };
   try {
     const size = source instanceof Uint8Array ? source.length : source.size;
     if (!Number.isSafeInteger(size) || size < 0) throw new CorruptError("Invalid UnityFS source size");
@@ -117,6 +137,8 @@ export async function openBundleRange(
       header.compressedBlocksInfoSize, operation);
     let layout: ReturnType<typeof parseUnityFSInfo>;
     try {
+      // Blocks-info uses the same low-six-bit codec selector as payload blocks below.
+      if ((header.flags & 63) !== 0) diagnostics.blocksInfoDecodes += 1;
       layout = parseUnityFSInfo(header, info);
     } catch (cause) {
       if (location.ambiguousPadding && cause instanceof CorruptError) {
@@ -168,6 +190,7 @@ export async function openBundleRange(
     const api: BundleRangeReader = {
       header,
       entries,
+      get diagnostics() { return Object.freeze({ ...diagnostics }); },
       async readRanges(ranges, consume, abortSignal) {
         if (!source) throw new Error("UnityFS range reader is closed");
         if (active) throw new Error("UnityFS range reader already has an active batch");
@@ -186,6 +209,8 @@ export async function openBundleRange(
         }
         const op = new RangeOperation(abortSignal);
         active = op;
+        diagnostics.rangeBatches += 1;
+        diagnostics.ranges += spans.length;
         try {
           op.check();
           for (const block of blocks) {
@@ -194,6 +219,7 @@ export async function openBundleRange(
             if (intersections.length === 0) continue;
             let position = block.decoded;
             const output = async (bytes: Uint8Array): Promise<void> => {
+              diagnostics.decodedBytes += bytes.length;
               for (const span of intersections) {
                 const from = Math.max(position, span.start);
                 const end = Math.min(position + bytes.length, span.end);
@@ -203,6 +229,7 @@ export async function openBundleRange(
                   op.check();
                   const owned = new Uint8Array(stop - offset);
                   owned.set(bytes.subarray(offset - position, stop - position));
+                  diagnostics.deliveredBytes += owned.length;
                   await op.wait(consume(span.range, owned, offset - span.start));
                   await op.yield();
                 }
@@ -214,6 +241,7 @@ export async function openBundleRange(
                 throw new CorruptError(`UnityFS block ${block.index}: compressed range exceeds block`);
               }
               if (!source) throw new Error("UnityFS range reader is closed");
+              diagnostics.compressedBytesRequested += length;
               return readSource(source, block.compressed + offset, length, op);
             };
             const type = block.flags & 63;
@@ -231,15 +259,19 @@ export async function openBundleRange(
                     // Typed-array subclasses can make slice() return a view.
                     const owned = new Uint8Array(bytes.length);
                     owned.set(bytes);
+                    diagnostics.decodedBytes += bytes.length;
+                    diagnostics.deliveredBytes += owned.length;
                     await op.wait(consume(span.range, owned, offset - span.start));
                     await op.yield();
                   }
                 }
               } else if (type === 2 || type === 3) {
+                diagnostics.lz4Decodes += 1;
                 await streamLz4(read, block.compressedSize, block.uncompressedSize, output, op);
               } else if (type === 1) {
                 if (block.compressedSize < 5) throw new CorruptError("LZMA block has no properties");
                 const props = await read(0, 5);
+                diagnostics.lzmaDecodes += 1;
                 await streamLzma(props, (offset, length) => read(offset + 5, length),
                   block.compressedSize - 5, block.uncompressedSize, output, op);
               } else {

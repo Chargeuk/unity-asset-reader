@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { createHash } from "node:crypto";
 import { compress } from "lzma1";
 import { openBundleRange } from "../src/bundle/BundleRangeReader.js";
 import { ObjectReader } from "../src/serialized/ObjectReader.js";
@@ -857,6 +858,38 @@ test("reports a bundle whose signature is not a container at all", () => {
 });
 
 // --- selected acquisition: independent fixture goldens and owned spans ------
+
+for (const [name, codec] of [["lz4.bundle", "lz4"], ["lzma.bundle", "lzma"], ["uncompressed.bundle", "stored"]] as const) {
+  test(`range diagnostics count actual ${codec} invocations and owned bytes across repeated batches`, async () => {
+    // These existing writer fixtures contain one payload block. Its CAB begins
+    // with SHA256("<stem>:cab") in make-fixtures.py, independent of this parser.
+    const reader = await openBundleRange(loadFixture(name));
+    try {
+      const stem = name.slice(0, -".bundle".length);
+      const entry = reader.entries.find((item) => item.path === `CAB-${stem}`)!;
+      const first = await reader.readRange({ entry, offset: 0, length: 1 });
+      assert.deepEqual(first, Uint8Array.of(createHash("sha256").update(`${stem}:cab`).digest()[0]!));
+      const snapshot = reader.diagnostics!;
+      assert.ok(Object.isFrozen(snapshot));
+      assert.equal(snapshot.rangeBatches, 1);
+      assert.equal(snapshot.ranges, 1);
+      assert.equal(snapshot.deliveredBytes, 1);
+      assert.equal(snapshot.blocksInfoDecodes, codec === "stored" ? 0 : 1);
+      assert.equal(snapshot.lz4Decodes, codec === "lz4" ? 1 : 0);
+      assert.equal(snapshot.lzmaDecodes, codec === "lzma" ? 1 : 0);
+      assert.ok(snapshot.compressedBytesRequested > 0);
+      const second = await reader.readRange({ entry, offset: 0, length: 1 });
+      assert.deepEqual(second, first);
+      assert.notEqual(second.buffer, first.buffer);
+      assert.equal(reader.diagnostics!.rangeBatches, 2);
+      assert.equal(reader.diagnostics!.deliveredBytes, 2);
+      assert.equal(reader.diagnostics!.lz4Decodes, codec === "lz4" ? 2 : 0);
+      assert.equal(reader.diagnostics!.lzmaDecodes, codec === "lzma" ? 2 : 0);
+      assert.equal(snapshot.rangeBatches, 1, "earlier snapshots do not retain mutable diagnostic state");
+      assert.equal(reader.diagnostics!.decodedBytes, snapshot.decodedBytes * 2);
+    } finally { reader.close(); }
+  });
+}
 
 for (const name of [...UNITYFS_FIXTURES, ...STRIPPED_FIXTURES]) {
   test(`selected ranges of ${name} match the independent golden`, async () => {
