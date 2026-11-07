@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { buildSync } from "esbuild";
 import { compress } from "lzma1";
 import { RangeOperation } from "../src/bundle/rangeIO.js";
 
@@ -280,24 +282,144 @@ test("incremental raw decoder cancels stalled input, consumer and a large in-fli
     const input = container?.subarray(13) ?? STREAM_5D;
     const props = container?.subarray(0, 5) ?? PROPS_5D;
     let calls = 0;
-    if (where === "turn") setTimeout(() => abort.abort(reason), 0);
+    let cancelTimer: ReturnType<typeof setTimeout> | undefined;
     try {
       await assert.rejects(streamLzma(props, async (at, length) => {
         if (where === "input") {
-          setTimeout(() => abort.abort(reason), 0);
+          cancelTimer = setTimeout(() => abort.abort(reason), 0);
           return new Promise<Uint8Array>(() => {});
         }
         return input.slice(at, at + length);
-      }, input.length, size, async () => {
+      }, input.length, size, async (bytes) => {
         calls++;
         if (where === "consumer") {
-          setTimeout(() => abort.abort(reason), 0);
+          cancelTimer = setTimeout(() => abort.abort(reason), 0);
           await new Promise<void>(() => {});
         }
-      }, operation), (error: unknown) => error === reason);
-      if (where === "before" || where === "input") assert.equal(calls, 0);
-    } finally { operation.finish(); }
+        if (where === "turn") {
+          // Abort at actual partial output, before stream completion can race a
+          // timer. External task/message delivery is covered by the worker test.
+          assert.ok(bytes.length > 0 && bytes.length < size, `cancel ${where}: partial output`);
+          abort.abort(reason);
+        }
+      }, operation), (error: unknown) => error === reason, `cancel ${where}`);
+      if (where === "before" || where === "input") assert.equal(calls, 0, `cancel ${where}`);
+      if (where === "turn") assert.equal(calls, 1, `cancel ${where}: no later output`);
+    } finally {
+      if (cancelTimer !== undefined) clearTimeout(cancelTimer);
+      operation.finish();
+    }
   }
+});
+
+test("range task turns preserve concurrent waits, queued cancellation, worker messages and timer fallback", () => {
+  const io = new URL("../src/bundle/rangeIO.ts", import.meta.url).href;
+  // Bundle the actual module and its real imports into memory. The worker then
+  // loads ordinary JS, independent of Node's strip-only/tsx interop; no fixture
+  // class copy or generated source file can drift from the implementation.
+  const bundle = buildSync({
+    entryPoints: [fileURLToPath(io)], bundle: true, write: false,
+    format: "esm", platform: "node", target: "es2020",
+  });
+  assert.equal(bundle.outputFiles.length, 1);
+  const workerModule = `data:text/javascript;base64,${Buffer.from(bundle.outputFiles[0]!.contents).toString("base64")}`;
+  const workerScript = `
+import assert from 'node:assert/strict';
+import {parentPort,workerData} from 'node:worker_threads';
+const module=await import(workerData);
+const RangeOperation=module.RangeOperation??module.default?.RangeOperation;
+const abort=new AbortController(), reason=new Error('worker message cancellation');
+const operation=new RangeOperation(abort.signal);
+let calls=0;
+parentPort.once('message',()=>abort.abort(reason));
+parentPort.postMessage('running');
+try {
+  while(true) {calls++;await operation.yield();}
+} catch(error) {
+  assert.equal(error,reason);
+  parentPort.postMessage({cancelled:true,calls});
+} finally {operation.finish();parentPort.close();}
+`;
+  // A child bounds a broken microtask-only implementation too: an in-process
+  // timeout cannot fire if it starves the event loop. No speed assertion is made.
+  const script = `
+import assert from 'node:assert/strict';
+import {Worker} from 'node:worker_threads';
+const module=await import(${JSON.stringify(io)});
+const RangeOperation=module.RangeOperation??module.default?.RangeOperation;
+const NativeChannel=globalThis.MessageChannel, nativeTimeout=globalThis.setTimeout;
+let channels=0, closes=0;
+globalThis.MessageChannel=class {
+  constructor() {
+    channels++;
+    const channel=new NativeChannel();
+    for(const port of [channel.port1,channel.port2]) {
+      const close=port.close.bind(port);
+      port.close=()=>{closes++;close();};
+    }
+    return channel;
+  }
+};
+const operation=new RangeOperation();
+try {
+  for(let i=0;i<63;i++) await operation.yield();
+  assert.equal(channels,0,'short work must not allocate ports');
+  const producer=operation.yield();
+  for(let i=0;i<63;i++) await operation.yield();
+  const consumer=operation.yield();
+  await Promise.all([producer,consumer]);
+  assert.equal(channels,1,'concurrent turns share one channel, not one resolver');
+} finally {operation.finish();operation.finish();}
+assert.equal(closes,2,'finish closes both ports exactly once');
+const abort=new AbortController(), reason=Object.freeze(new Error('queued task cancelled'));
+const cancelled=new RangeOperation(abort.signal);
+try {
+  for(let i=0;i<63;i++) await cancelled.yield();
+  const pending=cancelled.yield();
+  const rejected=assert.rejects(pending,error=>error===reason);
+  abort.abort(reason);
+  await rejected;
+  await assert.rejects(cancelled.yield(),error=>error===reason);
+} finally {cancelled.finish();}
+assert.equal(channels,2);assert.equal(closes,4,'cancel releases ports before finish');
+const worker=new Worker(new URL('data:text/javascript,'+encodeURIComponent(${JSON.stringify(workerScript)})),{
+  workerData:${JSON.stringify(workerModule)},execArgv:[],
+});
+let reply;
+try {
+  const result=new Promise((resolve,reject)=>{
+    worker.on('message',message=>{
+      if(message==='running') worker.postMessage('abort');
+      else {reply=message;resolve(message);}
+    });
+    worker.on('error',reject);
+    worker.on('exit',()=>{if(!reply)reject(new Error('worker exited before reporting cancellation'));});
+  });
+  const exit=new Promise((resolve,reject)=>{
+    worker.on('error',reject);
+    worker.on('exit',code=>code===0?resolve():reject(new Error('worker exit '+code)));
+  });
+  await Promise.all([result,exit]);
+  assert.equal(reply.cancelled,true);
+  assert.ok(reply.calls>=64,'abort message must run while the yielding loop is active');
+} finally {await worker.terminate();}
+// Simulate only the missing host capability, retaining the real native timer.
+globalThis.MessageChannel=undefined;
+let timers=0;
+globalThis.setTimeout=(...args)=>{timers++;return nativeTimeout(...args);};
+const fallback=new RangeOperation();
+try {
+  for(let i=0;i<128;i++) await fallback.yield();
+  assert.equal(timers,2,'fallback retains the shared 64-call task cadence');
+} finally {
+  fallback.finish();globalThis.MessageChannel=NativeChannel;globalThis.setTimeout=nativeTimeout;
+}
+console.log(JSON.stringify({channels,closes,workerCalls:reply.calls,timers}));
+`;
+  const result = spawnSync(process.execPath,
+    ["--unhandled-rejections=strict", "--import", "tsx", "--input-type=module", "-e", script],
+    { encoding: "utf8", timeout: 120000 });
+  assert.equal(result.status, 0, [result.stderr, result.stdout, String(result.error)].join("\n"));
 });
 
 test("48 MiB one-block expansion bounds native queues and releases completed waits/output before finish", () => {
@@ -313,9 +435,35 @@ test("48 MiB one-block expansion bounds native queues and releases completed wai
   const script = `
 import assert from 'node:assert/strict';
 const Native = globalThis.TransformStream;
+const NativeChannel = globalThis.MessageChannel;
 const nativeTimeout = globalThis.setTimeout;
 let current, inYield=false;
 const timings=[];
+let channels=0, closedPorts=0;
+// Observe native port tasks too; keep the original postMessage and delivery.
+// Queue only timing scalars, never decoded output or a per-write trace.
+globalThis.MessageChannel=class {
+  constructor() {
+    const channel=new NativeChannel(), sent=[];
+    channels++;
+    const post=channel.port2.postMessage.bind(channel.port2);
+    channel.port2.postMessage=(...args)=>{
+      const owner=inYield?current:undefined;
+      sent.push({owner,began:performance.now()});
+      if(owner) owner.yieldMessages++;
+      return post(...args);
+    };
+    channel.port1.addEventListener('message',()=>{
+      const delivery=sent.shift();
+      if(delivery?.owner) delivery.owner.yieldMessageWaitMs+=performance.now()-delivery.began;
+    });
+    for(const port of [channel.port1,channel.port2]) {
+      const close=port.close.bind(port);
+      port.close=()=>{closedPorts++;close();};
+    }
+    return channel;
+  }
+};
 // Observe only timers synchronously scheduled by the real yield method. Keep
 // its cadence, native timer, stream pressure and cancellation path unchanged.
 globalThis.setTimeout=(callback,delay,...args)=>{
@@ -341,7 +489,7 @@ async function measure(label,inputBytes,outputBytes,consumer,work) {
     accounting:'overlapping elapsed aggregates; do not sum or label waits as CPU',
     transformCalls:0,transformMs:0,flushMs:0,writeCalls:0,writeBytes:0,writeWaitMs:0,
     readWaitMs:0,readBytes:0,sourceCalls:0,sourceMs:0,consumerCalls:0,consumerMs:0,
-    yieldCalls:0,yieldTimers:0,yieldTimerWaitMs:0,peakQueuedBytes:0};
+    yieldCalls:0,yieldTimers:0,yieldTimerWaitMs:0,yieldMessages:0,yieldMessageWaitMs:0,peakQueuedBytes:0};
   current=record;
   const began=performance.now(), cpu=process.cpuUsage();
   const snapshot=outcome=>({...record,outcome,wallMs:performance.now()-began,
@@ -484,6 +632,7 @@ try {
   outputRetained=await collectReleased(completedOutput,2*524288+maximumCurrent);
   operation.check();
   assert.equal(globalThis.retainedRangeOperation,operation);
+  operation.finish();
   // The expansion fixture has very few compressed writes. This bounded input
   // exercises write/yield scheduling; both byte expectations come from the
   // stated xorshift sequence, never from decoder output. It is not a corpus
@@ -518,17 +667,20 @@ try {
       assert.equal(record.readBytes,record.expectedOutputBytes);
       assert.equal(record.writeCalls,Math.ceil(record.inputBytes/16));
       assert.equal(record.transformCalls,record.writeCalls);
-      assert.equal(record.yieldTimers,Math.floor(record.yieldCalls/64));
+      assert.equal(record.yieldMessages+record.yieldTimers,Math.floor(record.yieldCalls/64));
+      assert.equal(record.yieldTimers,0,'native channel turns must not schedule nested timers');
       assert.ok(record.peakQueuedBytes<=2*512*273*(16+64+1)+524288);
       for(const [key,value] of Object.entries(record)) {
         if(key.endsWith('Ms')) assert.ok(Number.isFinite(value)&&value>=0,key);
       }
     }
-    console.log(JSON.stringify({total,peak,maximumCurrent,waitRetained,outputRetained,timings}));
   } finally {schedulingOperation.finish();}
+  assert.equal(channels,2,'one lazy channel per operation');
+  assert.equal(closedPorts,2*channels,'finish releases both ports exactly once');
+  console.log(JSON.stringify({total,peak,maximumCurrent,waitRetained,outputRetained,timings}));
 } finally {
   operation.finish();delete globalThis.retainedRangeOperation;
-  globalThis.TransformStream=Native;globalThis.setTimeout=nativeTimeout;
+  globalThis.TransformStream=Native;globalThis.MessageChannel=NativeChannel;globalThis.setTimeout=nativeTimeout;
 }
 `;
   const result = spawnSync(process.execPath, ["--expose-gc", "--unhandled-rejections=strict", "--import", "tsx", "--input-type=module", "-e", script], {

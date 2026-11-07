@@ -17,6 +17,16 @@ export interface SliceableBlob {
 // All target runtimes supply timers; only this structural member is used.
 declare function setTimeout(callback: () => void, delay: number): unknown;
 
+// Locally typed WHATWG ports keep DOM/Node declarations out of core's API.
+interface TaskPort {
+  onmessage: (() => void) | null;
+  postMessage(value: null): void;
+  close(): void;
+}
+declare const MessageChannel: {
+  new (): { port1: TaskPort; port2: TaskPort };
+};
+
 /** Internal per-read cancellation and macrotask ownership, also used by codecs. */
 export class RangeOperation {
   // Keep only live waiters. Racing every read/write against one never-settled
@@ -25,6 +35,8 @@ export class RangeOperation {
   private failure: unknown;
   private cancelled = false;
   private ticks = 0;
+  private taskChannel: { port1: TaskPort; port2: TaskPort } | undefined;
+  private readonly turns: Array<() => void> = [];
   private readonly onAbort = (): void => this.cancel(this.signal?.reason);
 
   constructor(private readonly signal?: RangeAbortSignal) {
@@ -44,6 +56,7 @@ export class RangeOperation {
       : reason;
     for (const reject of this.pending) reject(this.failure);
     this.pending.clear();
+    this.closeTaskChannel();
   }
 
   wait<T>(value: PromiseLike<T> | T): Promise<T> {
@@ -76,15 +89,42 @@ export class RangeOperation {
 
   async yield(): Promise<void> {
     this.check();
-    // Promise-only chains starve worker abort messages. A task turn every 64
-    // bounded reads/flushes lets those messages run without a platform scheduler.
+    // Keep a real task turn every 64 shared producer/consumer calls: promise-only
+    // chains starve abort messages. Nested timers imposed ~4 ms per turn in the
+    // retained Epi trace. A port task has no timer-nesting floor and carries no
+    // source bytes; cadence, codec writes and awaited backpressure stay unchanged.
     if (++this.ticks % 64 === 0) {
-      await this.wait(new Promise<void>((resolve) => { setTimeout(resolve, 0); }));
+      await this.wait(new Promise<void>((resolve) => {
+        if (typeof MessageChannel === "undefined") {
+          setTimeout(resolve, 0);
+          return;
+        }
+        if (!this.taskChannel) {
+          this.taskChannel = new MessageChannel();
+          this.taskChannel.port1.onmessage = () => { this.turns.shift()?.(); };
+        }
+        // Producer and consumer can both await turns. Each posted task owns its
+        // resolver; overwriting a single callback would strand the other waiter.
+        this.turns.push(resolve);
+        this.taskChannel.port2.postMessage(null);
+      }));
     }
+  }
+
+  private closeTaskChannel(): void {
+    if (!this.taskChannel) return;
+    this.taskChannel.port1.onmessage = null;
+    this.taskChannel.port1.close();
+    this.taskChannel.port2.close();
+    this.taskChannel = undefined;
+    // Settle underlying void promises too. wait() has already rejected cancelled
+    // owners, so releasing queued tasks cannot resume their cancelled consumers.
+    for (const resolve of this.turns.splice(0)) resolve();
   }
 
   finish(): void {
     this.signal?.removeEventListener("abort", this.onAbort);
+    this.closeTaskChannel();
   }
 }
 
