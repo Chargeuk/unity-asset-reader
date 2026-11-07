@@ -859,6 +859,329 @@ test("reports a bundle whose signature is not a container at all", () => {
 
 // --- selected acquisition: independent fixture goldens and owned spans ------
 
+/** Owned BE SerializedFile: one class-49 object at relative byte 0, pathID 7.
+ * Fields are specified here, not generated from reader output. Body is not metadata.
+ */
+function metadataFixture(format = 17, bodySize = 4, user = "", externals: string[] = []) {
+  const meta = new Writer();
+  meta.cstr("2018.1.9f2"); meta.u32(5);
+  if (format >= 13) meta.u8(0); // no type trees
+  const typeCountAt = meta.length;
+  meta.u32(format >= 16 ? 1 : 0);
+  if (format >= 16) {
+    meta.u32(49); meta.u8(0);
+    if (format >= 17) meta.u16(65535);
+    meta.bytes(new Uint8Array(16));
+  }
+  if (format < 14) meta.u32(0); // 32-bit path IDs
+  meta.u32(1);
+  if (format >= 14) { meta.align(4); meta.i64(7n); }
+  else meta.u32(7);
+  if (format >= 22) meta.i64(0n); else meta.u32(0);
+  const objectSizeAt = meta.length;
+  meta.u32(4); meta.u32(format >= 16 ? 0 : 49);
+  if (format < 16) meta.u16(49);
+  if (format < 11) meta.u16(0);
+  else if (format < 17) meta.u16(65535);
+  if (format === 15 || format === 16) meta.u8(0);
+  if (format >= 11) meta.u32(0); // scripts
+  meta.u32(externals.length);
+  for (const path of externals) {
+    meta.cstr(""); meta.bytes(new Uint8Array(16)); meta.u32(2); meta.cstr(path);
+  }
+  if (format >= 20) meta.u32(0); // referenced types
+  meta.cstr(user);
+  const headerSize = format >= 22 ? 48 : 20;
+  const prefixSize = headerSize + meta.length;
+  const dataOffset = Math.ceil(prefixSize / 16) * 16;
+  const size = dataOffset + bodySize;
+  const header = new Writer();
+  header.u32(format >= 22 ? 0 : meta.length);
+  header.u32(format >= 22 ? 0 : size);
+  header.u32(format); header.u32(format >= 22 ? 0 : dataOffset);
+  header.u8(1); header.bytes(new Uint8Array(3));
+  if (format >= 22) {
+    header.u32(meta.length); header.i64(BigInt(size));
+    header.i64(BigInt(dataOffset)); header.i64(0n);
+  }
+  const bytes = new Uint8Array(size);
+  bytes.set(header.build()); bytes.set(meta.build(), headerSize);
+  bytes.set(payload(bodySize), dataOffset);
+  return { bytes, prefixSize, dataOffset, objectSizeAt: headerSize + objectSizeAt,
+    typeCountAt: headerSize + typeCountAt };
+}
+
+/** Existing public writer creates only compressed input; never an expected value. */
+function metadataLzma(bytes: Uint8Array): Uint8Array {
+  const container = compress(bytes, { dictSize: 524288 });
+  return Uint8Array.from([...container.subarray(0, 5), ...container.subarray(13)]);
+}
+
+for (const format of [9, 17, 22, 23]) {
+  test(`single LZMA metadata format ${format} crosses a header/chunk boundary in one validated decode`, async () => {
+    // Each C string fits the existing 32767-byte bound. Valid external records
+    // keep metadata above 64 KiB without expecting an overlong string to survive.
+    const externals = ["dep-a/".repeat(4000) + "a.assets", "dep-b/".repeat(4000) + "b.assets"];
+    const fixture = metadataFixture(format, 4, "owned".repeat(6000), externals);
+    assert.ok(fixture.prefixSize > 65536, "retain metadata across bounded chunk boundaries");
+    const gap = 524288 - (format >= 22 ? 19 : 3);
+    const decoded = new Uint8Array(gap + fixture.bytes.length + 73).fill(71);
+    decoded.set(fixture.bytes, gap);
+    const raw = metadataLzma(decoded);
+    const bundle = buildBundle({ blocks: [{data: raw, flags: 1, uncompressedSize: decoded.length}],
+      nodes: [{path: "CAB-owned", offset: gap, size: fixture.bytes.length, flags: NodeFlags.SerializedFile}] });
+    const reads: number[] = [];
+    const reader = await openBundleRange({size: bundle.length, slice(start, end) {
+      reads.push(end - start);
+      return {async arrayBuffer() { return bundle.slice(start, end).buffer; }};
+    }});
+    reads.length = 0;
+    let callbacks = 0;
+    try {
+      const entry = reader.entries[0]!;
+      await reader.readMetadata([entry], (actualEntry, file) => {
+        callbacks++;
+        assert.equal(actualEntry, entry);
+        assert.equal(reader.diagnostics!.decodedBytes, decoded.length, "publication follows full block validation");
+        assert.equal(file.header.version, format);
+        assert.equal(file.header.fileSize, fixture.bytes.length);
+        assert.equal(file.unityVersion, "2018.1.9f2");
+        assert.equal(file.userInformation, "owned".repeat(6000));
+        assert.deepEqual(file.externals.map((external) => external.pathName), externals);
+        assert.ok(file.externals.every((external) => external.type === 2 &&
+          external.guid!.every((byte) => byte === 0)));
+        assert.equal(file.objects.length, 1);
+        assert.equal(file.objects[0]!.pathId, 7n);
+        assert.equal(file.objects[0]!.classId, 49);
+        assert.equal(file.objects[0]!.byteStart, fixture.dataOffset);
+        assert.equal(file.objects[0]!.byteSize, 4);
+        assert.equal(file.header.reserved.buffer.byteLength, fixture.prefixSize,
+          "metadata views must not pin the decoded body/gaps");
+      });
+      assert.equal(callbacks, 1);
+      assert.equal(reader.diagnostics!.rangeBatches, 1);
+      assert.equal(reader.diagnostics!.ranges, 1);
+      assert.equal(reader.diagnostics!.lzmaDecodes, 1);
+      assert.equal(reader.diagnostics!.compressedBytesRequested, raw.length);
+      assert.equal(reader.diagnostics!.deliveredBytes, fixture.prefixSize);
+      assert.equal(reads.reduce((sum, size) => sum + size, 0), raw.length);
+      assert.ok(reads.every((size) => size <= 65536));
+      const object = await reader.readRange({entry, offset: fixture.dataOffset, length: 4});
+      assert.deepEqual(object, payload(4));
+      assert.equal(object.buffer.byteLength, 4);
+      assert.equal(reader.diagnostics!.lzmaDecodes, 2, "object acquisition is independent, not a decoded-body cache");
+    } finally { reader.close(); }
+  });
+}
+
+test("single selected LZMA file metadata retains independent editor goldens and absolute object identity", async () => {
+  const name = "editor/2020.3.30f1/lzma/shared";
+  const original = readBundle(loadFixture(name)).files.find((item) => (item.flags & NodeFlags.SerializedFile) !== 0)!;
+  const reader = await openBundleRange(buildBundle({blocks: [{data: metadataLzma(original.data), flags: 1,
+    uncompressedSize: original.data.length}],
+    nodes: [{path: original.path, offset: 0, size: original.data.length, flags: NodeFlags.SerializedFile}]}));
+  try {
+    const entry = reader.entries.find((item) => (item.flags & NodeFlags.SerializedFile) !== 0)!;
+    let calls = 0;
+    await reader.readMetadata([entry], (actual, file) => {
+      calls++;
+      assert.equal(actual, entry);
+      assert.equal(file.unityVersion, golden(name).serialized![entry.path]!.unityVersion);
+      assert.deepEqual(file.objects.map((object) => ({pathId: String(object.pathId),
+        classId: object.classId, byteSize: object.byteSize})).sort((a, b) =>
+        a.pathId < b.pathId ? -1 : a.pathId > b.pathId ? 1 : 0), golden(name).objects[entry.path]);
+      assert.ok(file.objects.every((object) => object.byteStart >= file.header.dataOffset &&
+        object.byteStart + object.byteSize <= entry.size));
+    });
+    assert.equal(calls, 1);
+    assert.equal(reader.diagnostics!.rangeBatches, 1);
+    assert.equal(reader.diagnostics!.lzmaDecodes, 1);
+  } finally { reader.close(); }
+});
+
+test("single LZMA metadata rejects invalid prefixes, file/object extents and allocation sizes before publication", async () => {
+  for (const kind of ["metadata", "file", "data", "object", "limit", "legacy", "short", "empty"] as const) {
+    const fixture = metadataFixture();
+    const view = new DataView(fixture.bytes.buffer);
+    let nodeSize = fixture.bytes.length, decodedSize = fixture.bytes.length;
+    if (kind === "metadata") view.setUint32(fixture.typeCountAt, 0xffffffff);
+    if (kind === "file") view.setUint32(4, nodeSize + 1);
+    if (kind === "data") view.setUint32(12, 20);
+    if (kind === "object") view.setUint32(fixture.objectSizeAt, 5);
+    if (kind === "legacy") view.setUint32(8, 8);
+    if (kind === "short") nodeSize = 19;
+    if (kind === "empty") nodeSize = 0;
+    if (kind === "limit") {
+      decodedSize = nodeSize = 64 * 1024 * 1024 + 32;
+      view.setUint32(0, 64 * 1024 * 1024);
+      view.setUint32(4, nodeSize); view.setUint32(12, nodeSize - 4);
+    }
+    const reader = await openBundleRange(buildBundle({
+      blocks: [{data: metadataLzma(fixture.bytes), flags: 1, uncompressedSize: decodedSize}],
+      nodes: [{path: "CAB-invalid", offset: 0, size: nodeSize}],
+    }));
+    try {
+      await assert.rejects(reader.readMetadata([reader.entries[0]!], () => assert.fail(`${kind}: published invalid metadata`)),
+        (error: unknown) => error instanceof (kind === "limit" || kind === "legacy" ? UnsupportedError : CorruptError), kind);
+    } finally { reader.close(); }
+  }
+});
+
+test("single LZMA metadata does not publish a valid prefix before truncated, corrupt or declared-size failure", async () => {
+  const fixture = metadataFixture(17, 1024 * 1024);
+  const encoded = metadataLzma(fixture.bytes);
+  const shorter = fixture.bytes.slice();
+  new DataView(shorter.buffer).setUint32(4, shorter.length - 1);
+  const encodedShorter = metadataLzma(shorter);
+  for (const kind of ["truncated", "corrupt", "short-output", "long-output"] as const) {
+    const raw = kind === "truncated" ? encoded.slice(0, Math.floor(encoded.length / 2))
+      : kind === "long-output" ? encodedShorter : encoded.slice();
+    if (kind === "corrupt") raw[0] = 255; // impossible LZMA properties, not a metadata mutation
+    const decodedSize = fixture.bytes.length + (kind === "short-output" ? 1 : kind === "long-output" ? -1 : 0);
+    const reader = await openBundleRange(buildBundle({blocks: [{data: raw, flags: 1, uncompressedSize: decodedSize}],
+      nodes: [{path: "CAB-invalid-tail", offset: 0, size: Math.min(fixture.bytes.length, decodedSize)}]}));
+    let published = 0;
+    try {
+      await assert.rejects(reader.readMetadata([reader.entries[0]!], () => { published++; }), CorruptError, kind);
+      assert.equal(published, 0, kind);
+      if (kind === "short-output") assert.equal(reader.diagnostics!.deliveredBytes, fixture.prefixSize,
+        "a fully acquired valid prefix remains provisional until the codec finishes");
+    } finally { reader.close(); }
+  }
+});
+
+for (const layout of ["stored", "lz4", "multiple-files", "multiple-blocks"] as const) {
+  test(`metadata retains two-phase acquisition and ordering for ${layout}`, async () => {
+    const fixture = metadataFixture();
+    const decoded = new Uint8Array(fixture.bytes.length * (layout === "multiple-blocks" ? 1 : 2));
+    decoded.set(fixture.bytes);
+    if (layout !== "multiple-blocks") decoded.set(fixture.bytes, fixture.bytes.length);
+    const pieces = layout === "multiple-blocks" ? [decoded.subarray(0, 24), decoded.subarray(24)] : [decoded];
+    const type = layout === "stored" ? 0 : layout === "lz4" ? 2 : 1;
+    const reader = await openBundleRange(buildBundle({
+      blocks: pieces.map((bytes) => ({flags: type, uncompressedSize: bytes.length,
+        data: type === 0 ? bytes : type === 2 ? lz4Literals(bytes) : metadataLzma(bytes)})),
+      nodes: layout === "multiple-blocks" ? [{path: "CAB-a", offset: 0, size: fixture.bytes.length}]
+        : [{path: "CAB-a", offset: 0, size: fixture.bytes.length},
+          {path: "CAB-b", offset: fixture.bytes.length, size: fixture.bytes.length}],
+    }));
+    try {
+      const received: string[] = [];
+      await reader.readMetadata([...reader.entries].reverse(), async (entry, file) => {
+        received.push(entry.path);
+        assert.equal(file.objects[0]!.pathId, 7n);
+        assert.equal(file.objects[0]!.byteStart, fixture.dataOffset);
+        await Promise.resolve();
+      });
+      assert.deepEqual(received, reader.entries.map((entry) => entry.path));
+      assert.equal(reader.diagnostics!.rangeBatches, 2);
+      assert.equal(reader.diagnostics!.deliveredBytes, reader.entries.length * (48 + fixture.prefixSize));
+      assert.equal(reader.diagnostics!.lz4Decodes, type === 2 ? 2 : 0);
+      assert.equal(reader.diagnostics!.lzmaDecodes, type === 1 ? pieces.length * 2 : 0);
+    } finally { reader.close(); }
+  });
+}
+
+test("single LZMA metadata holds active ownership through awaited publication and preserves consumer causes", async () => {
+  const fixture = metadataFixture();
+  const reader = await openBundleRange(buildBundle({blocks: [{data: metadataLzma(fixture.bytes), flags: 1,
+    uncompressedSize: fixture.bytes.length}], nodes: [{path: "CAB-owned", offset: 0, size: fixture.bytes.length}]}));
+  const entry = reader.entries[0]!;
+  let release!: () => void, entered!: () => void;
+  const started = new Promise<void>((resolve) => { entered = resolve; });
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  let calls = 0;
+  const reading = reader.readMetadata([entry], async () => { calls++; entered(); await gate; });
+  try {
+    await started;
+    await assert.rejects(reader.readRange({entry, offset: 0, length: 1}), /active batch/);
+    await assert.rejects(reader.readRanges([], () => {}), /active batch/);
+    await assert.rejects(reader.readMetadata([entry], () => {}), /active batch/);
+    assert.equal(reader.diagnostics!.decodedBytes, fixture.bytes.length);
+    release(); await reading;
+    assert.equal(calls, 1);
+    const reason = Object.freeze(new Error("owned metadata consumer rejected"));
+    for (const consume of [() => { throw reason; }, async () => { throw reason; }]) {
+      await assert.rejects(reader.readMetadata([entry], consume),
+        (error: unknown) => error instanceof Error && error.message.includes("UnityFS block 0") &&
+          (error as Error & {cause?: unknown}).cause === reason);
+    }
+    assert.equal(reason.message, "owned metadata consumer rejected");
+    assert.deepEqual(await reader.readRange({entry, offset: fixture.dataOffset, length: 4}), payload(4));
+    await assert.rejects(reader.readMetadata([{...entry}], () => {}), /another reader/);
+    await assert.rejects(reader.readMetadata([entry, entry], () => {}), /duplicate/);
+  } finally { release(); reader.close(); await reading.catch(() => {}); }
+});
+
+for (const phase of ["before", "acquisition", "decode", "consumer"] as const) {
+  for (const action of ["abort", "close"] as const) {
+    test(`single LZMA metadata ${action} during ${phase} observes late rejections and settles its batch`, async () => {
+      const fixture = metadataFixture(17, phase === "decode" ? 192 * 1024 : 4);
+      if (phase === "decode") {
+        // Independent xorshift bytes force multiple compressed acquisitions;
+        // cancellation is gated on the second read after real prefix decoding.
+        let state = 0x12345678;
+        for (let i = fixture.dataOffset; i < fixture.bytes.length; i++) {
+          state ^= state << 13; state ^= state >>> 17; state ^= state << 5;
+          fixture.bytes[i] = state & 255;
+        }
+      }
+      const bundle = buildBundle({blocks: [{data: metadataLzma(fixture.bytes), flags: 1,
+        uncompressedSize: fixture.bytes.length}], nodes: [{path: "CAB-owned", offset: 0, size: fixture.bytes.length}]});
+      let armed = false, entered!: () => void, rejectLate!: (error: Error) => void;
+      const started = new Promise<void>((resolve) => { entered = resolve; });
+      const pending = new Promise<ArrayBuffer>((_resolve, reject) => { rejectLate = reject; });
+      let payloadReads = 0;
+      // The pending promise is used only by the assigned source/consumer seam.
+      if (phase === "before") void pending.catch(() => {});
+      const reader = await openBundleRange({size: bundle.length, slice(start, end) {
+        return {arrayBuffer() {
+          if (armed && (phase === "acquisition" ||
+              (phase === "decode" && end - start !== 5 && ++payloadReads === 2))) {
+            entered(); return pending;
+          }
+          return Promise.resolve(bundle.slice(start, end).buffer);
+        }};
+      }});
+      const abort = new AbortController(), reason = Object.freeze(new Error("owned metadata cancelled"));
+      let calls = 0;
+      const unhandled: unknown[] = [];
+      const observe = (error: unknown) => { unhandled.push(error); };
+      process.on("unhandledRejection", observe);
+      try {
+        if (phase === "before") {
+          if (action === "abort") abort.abort(reason); else reader.close();
+        }
+        armed = true;
+        const reading = reader.readMetadata([reader.entries[0]!], () => {
+          calls++; entered(); return pending.then(() => {});
+        }, abort.signal);
+        const rejected = assert.rejects(reading, action === "abort"
+          ? (error: unknown) => error === reason : /closed|cancelled/);
+        if (phase !== "before") {
+          await started;
+          if (phase === "decode") {
+            assert.equal(reader.diagnostics!.deliveredBytes, fixture.prefixSize);
+            assert.ok(reader.diagnostics!.decodedBytes > fixture.prefixSize);
+            assert.ok(reader.diagnostics!.decodedBytes < fixture.bytes.length);
+          }
+          if (action === "abort") abort.abort(reason); else reader.close();
+        }
+        await rejected;
+        rejectLate(new Error("late underlying failure"));
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        assert.deepEqual(unhandled, []);
+        assert.equal(calls, phase === "consumer" ? 1 : 0);
+        if (action === "abort") {
+          // Cancellation releases the batch; the still-open reader may be reused.
+          armed = false;
+          assert.equal((await reader.readRange({entry: reader.entries[0]!, offset: 0, length: 1})).length, 1);
+        }
+      } finally { reader.close(); process.off("unhandledRejection", observe); }
+    });
+  }
+}
+
 for (const [name, codec] of [["lz4.bundle", "lz4"], ["lzma.bundle", "lzma"], ["uncompressed.bundle", "stored"]] as const) {
   test(`range diagnostics count actual ${codec} invocations and owned bytes across repeated batches`, async () => {
     // These existing writer fixtures contain one payload block. Its CAB begins

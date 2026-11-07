@@ -149,10 +149,13 @@ for (const obj of env.objects) {
 `openBundleRange(input, signal?)` reads a UnityFS directory without inflating the whole payload.
 Its immutable entries identify ranges for that reader instance. `readRanges()` consumes ordered,
 nonoverlapping selections in decoded bundle order, delivering owned chunks of at most 64 KiB to an
-awaited callback; `readRange()` returns one owned span up to 64 MiB. `readMetadata()` batches file
-headers and metadata prefixes before passing parsed files to its callback. `close()` cancels an
-active read and releases the compressed source reference. Keep the input unchanged and available
-until `close()`. This path does not change the synchronous `load()` / `Env` APIs.
+awaited callback; `readRange()` returns one owned span up to 64 MiB. `readMetadata()` retains bounded
+file headers and metadata prefixes, not file bodies. When exactly one serialized file is selected
+from a single LZMA payload block, it decodes that payload once and validates the complete codec
+output before publishing metadata to the owned callback; other layouts use separate batched header
+and metadata-prefix phases. `close()` cancels an active read and releases the compressed source
+reference. Keep the input unchanged and available until `close()`. This path does not change the
+synchronous `load()` / `Env` APIs.
 
 Bytes returned by the existing `Env` APIs are views into your input or decompressed blocks, not
 copies. A small view keeps its whole buffer alive, so copy it (`data.slice()`) if you want to keep

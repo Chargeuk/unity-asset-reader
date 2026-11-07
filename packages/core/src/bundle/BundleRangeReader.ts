@@ -48,6 +48,8 @@ export type BundleRangeConsumer = (
 /** Cumulative acquisition counters, not retained byte buffers or a trace.
  * Codec counts are actual payload invocations, including failed attempts.
  * Bytes decoded include gaps; bytes delivered count only selected owned output.
+ * Metadata counts staged header/prefix bytes, even before validation/publication;
+ * discarded body bytes and parsed callback objects do not add delivered bytes.
  */
 export interface BundleRangeDiagnostics {
   readonly blocksInfoDecodes: number;
@@ -78,9 +80,11 @@ export interface BundleRangeReader {
   /** Read one owned span, up to 64 MiB. Larger spans use readRanges's bounded chunks. */
   readRange(range: BundleRange, signal?: RangeAbortSignal): Promise<Uint8Array>;
   /**
-   * Two batched acquisition phases (fixed headers, then metadata prefixes), not
-   * a block rescan per file. Validates full directory/file/object extents before
-   * exposing metadata. Format <9 has trailing metadata and is not supported here.
+   * One payload decode for one selected file in a single LZMA block; otherwise
+   * two batched phases (fixed headers, then metadata prefixes). Retains bounded
+   * prefixes, not bodies. The single-block path validates the complete codec
+   * before publication. Validates directory/file/object extents on both paths.
+   * Format <9 has trailing metadata and is not supported here.
    */
   readMetadata(entries: readonly BundleEntry[],
     consume: (entry: BundleEntry, file: SerializedFile) => void | Promise<void>,
@@ -187,119 +191,153 @@ export async function openBundleRange(
       return { start: base + range.offset, end: base + range.offset + range.length };
     };
 
-    const api: BundleRangeReader = {
-      header,
-      entries,
-      get diagnostics() { return Object.freeze({ ...diagnostics }); },
-      async readRanges(ranges, consume, abortSignal) {
-        if (!source) throw new Error("UnityFS range reader is closed");
-        if (active) throw new Error("UnityFS range reader already has an active batch");
-        // Snapshot caller-owned descriptors before the first await. The callback
-        // receives that stable selection, even if the caller mutates its array.
-        const spans = ranges.map((range) => {
-          const stable = Object.freeze({ ...range });
-          return { range: stable, ...selected(stable) };
-        });
-        let previous = -1;
-        for (const span of spans) {
-          if (span.start < previous) {
-            throw new CorruptError("UnityFS batch ranges must be ordered and nonoverlapping");
-          }
-          previous = span.end;
+    const metadataRange = (entry: BundleEntry, bytes: Uint8Array): BundleRange => {
+      const fileHeader = readSerializedFileHeader(bytes);
+      const length = (fileHeader.version >= 22 ? 48 : 20) + fileHeader.metadataSize;
+      if (fileHeader.fileSize !== entry.size || length > fileHeader.dataOffset ||
+          fileHeader.dataOffset > entry.size) {
+        throw new CorruptError(`UnityFS ${entry.path}: metadata/file extent disagrees with directory`);
+      }
+      bounded(length, "SerializedFile metadata size");
+      return { entry, offset: 0, length };
+    };
+
+    // Metadata uses the same batch owner through full codec validation and its
+    // awaited publication; no consumer await may outlive active-batch exclusion.
+    const readBatch = async (
+      ranges: readonly BundleRange[], consume: BundleRangeConsumer,
+      abortSignal?: RangeAbortSignal,
+      metadata?: {
+        collect: (bytes: Uint8Array, position: number) => void;
+        publish: () => void | Promise<void>;
+      },
+    ): Promise<void> => {
+      if (!source) throw new Error("UnityFS range reader is closed");
+      if (active) throw new Error("UnityFS range reader already has an active batch");
+      // Snapshot caller-owned descriptors before the first await. The callback
+      // receives that stable selection, even if the caller mutates its array.
+      const spans = ranges.map((range) => {
+        const stable = Object.freeze({ ...range });
+        return { range: stable, ...selected(stable) };
+      });
+      let previous = -1;
+      for (const span of spans) {
+        if (span.start < previous) {
+          throw new CorruptError("UnityFS batch ranges must be ordered and nonoverlapping");
         }
-        const op = new RangeOperation(abortSignal);
-        active = op;
-        diagnostics.rangeBatches += 1;
-        diagnostics.ranges += spans.length;
-        try {
-          op.check();
-          for (const block of blocks) {
-            const intersections = spans.filter((span) =>
-              span.start < block.decoded + block.uncompressedSize && span.end > block.decoded);
-            if (intersections.length === 0) continue;
-            let position = block.decoded;
-            const output = async (bytes: Uint8Array): Promise<void> => {
-              diagnostics.decodedBytes += bytes.length;
+        previous = span.end;
+      }
+      const op = new RangeOperation(abortSignal);
+      active = op;
+      diagnostics.rangeBatches += 1;
+      diagnostics.ranges += spans.length;
+      try {
+        op.check();
+        for (const block of blocks) {
+          const intersections = spans.filter((span) =>
+            span.start < block.decoded + block.uncompressedSize && span.end > block.decoded);
+          if (intersections.length === 0) continue;
+          let position = block.decoded;
+          const output = async (bytes: Uint8Array): Promise<void> => {
+            diagnostics.decodedBytes += bytes.length;
+            if (metadata) {
+              // Borrow this transient codec chunk only synchronously. Count
+              // copied prefix bytes, not discarded object bodies or gaps.
+              metadata.collect(bytes, position);
+              position += bytes.length;
+              return;
+            }
+            for (const span of intersections) {
+              const from = Math.max(position, span.start);
+              const end = Math.min(position + bytes.length, span.end);
+              for (let offset = from; offset < end; offset += 65536) {
+                const stop = Math.min(offset + 65536, end);
+                // Never leak a view that pins a decoder dictionary or burst.
+                op.check();
+                const owned = new Uint8Array(stop - offset);
+                owned.set(bytes.subarray(offset - position, stop - position));
+                diagnostics.deliveredBytes += owned.length;
+                await op.wait(consume(span.range, owned, offset - span.start));
+                await op.yield();
+              }
+            }
+            position += bytes.length;
+          };
+          const read = (offset: number, length: number): Promise<Uint8Array> => {
+            if (offset < 0 || length < 0 || offset > block.compressedSize - length) {
+              throw new CorruptError(`UnityFS block ${block.index}: compressed range exceeds block`);
+            }
+            if (!source) throw new Error("UnityFS range reader is closed");
+            diagnostics.compressedBytesRequested += length;
+            return readSource(source, block.compressed + offset, length, op);
+          };
+          const type = block.flags & 63;
+          try {
+            if (type === 0) {
+              if (block.compressedSize !== block.uncompressedSize) {
+                throw new CorruptError("stored block compressed/uncompressed sizes differ");
+              }
+              // Stored payloads need no history: acquire just the selected
+              // spans rather than scanning a potentially very large block.
               for (const span of intersections) {
-                const from = Math.max(position, span.start);
-                const end = Math.min(position + bytes.length, span.end);
-                for (let offset = from; offset < end; offset += 65536) {
-                  const stop = Math.min(offset + 65536, end);
-                  // Never leak a view that pins a decoder dictionary or burst.
-                  op.check();
-                  const owned = new Uint8Array(stop - offset);
-                  owned.set(bytes.subarray(offset - position, stop - position));
+                const end = Math.min(span.end, block.decoded + block.uncompressedSize);
+                for (let offset = Math.max(span.start, block.decoded); offset < end; offset += 65536) {
+                  const bytes = await read(offset - block.decoded, Math.min(65536, end - offset));
+                  // Typed-array subclasses can make slice() return a view.
+                  const owned = new Uint8Array(bytes.length);
+                  owned.set(bytes);
+                  diagnostics.decodedBytes += bytes.length;
                   diagnostics.deliveredBytes += owned.length;
                   await op.wait(consume(span.range, owned, offset - span.start));
                   await op.yield();
                 }
               }
-              position += bytes.length;
-            };
-            const read = (offset: number, length: number): Promise<Uint8Array> => {
-              if (offset < 0 || length < 0 || offset > block.compressedSize - length) {
-                throw new CorruptError(`UnityFS block ${block.index}: compressed range exceeds block`);
-              }
-              if (!source) throw new Error("UnityFS range reader is closed");
-              diagnostics.compressedBytesRequested += length;
-              return readSource(source, block.compressed + offset, length, op);
-            };
-            const type = block.flags & 63;
-            try {
-              if (type === 0) {
-                if (block.compressedSize !== block.uncompressedSize) {
-                  throw new CorruptError("stored block compressed/uncompressed sizes differ");
-                }
-                // Stored payloads need no history: acquire just the selected
-                // spans rather than scanning a potentially very large block.
-                for (const span of intersections) {
-                  const end = Math.min(span.end, block.decoded + block.uncompressedSize);
-                  for (let offset = Math.max(span.start, block.decoded); offset < end; offset += 65536) {
-                    const bytes = await read(offset - block.decoded, Math.min(65536, end - offset));
-                    // Typed-array subclasses can make slice() return a view.
-                    const owned = new Uint8Array(bytes.length);
-                    owned.set(bytes);
-                    diagnostics.decodedBytes += bytes.length;
-                    diagnostics.deliveredBytes += owned.length;
-                    await op.wait(consume(span.range, owned, offset - span.start));
-                    await op.yield();
-                  }
-                }
-              } else if (type === 2 || type === 3) {
-                diagnostics.lz4Decodes += 1;
-                await streamLz4(read, block.compressedSize, block.uncompressedSize, output, op);
-              } else if (type === 1) {
-                if (block.compressedSize < 5) throw new CorruptError("LZMA block has no properties");
-                const props = await read(0, 5);
-                diagnostics.lzmaDecodes += 1;
-                await streamLzma(props, (offset, length) => read(offset + 5, length),
-                  block.compressedSize - 5, block.uncompressedSize, output, op);
-              } else {
-                throw new UnsupportedError("compression type", type);
-              }
-            } catch (cause) {
-              // Abort reasons belong to the caller and may even be frozen.
-              // Other failures gain context through a cause chain, never by
-              // mutating somebody else's error or losing its classification.
-              if (abortSignal?.aborted || !source) throw cause;
-              const context = `UnityFS block ${block.index} at ${block.compressed}`;
-              const reason = cause instanceof Error ? cause.message : String(cause);
-              if (cause instanceof CorruptError) {
-                throw Object.assign(new CorruptError(`${context}: ${reason}`), { cause });
-              }
-              if (cause instanceof UnsupportedError) {
-                throw Object.assign(new UnsupportedError(cause.kind, cause.found,
-                  `${context}: ${reason}`), { cause });
-              }
-              throw Object.assign(new Error(`${context}: ${reason}`), { cause });
+            } else if (type === 2 || type === 3) {
+              diagnostics.lz4Decodes += 1;
+              await streamLz4(read, block.compressedSize, block.uncompressedSize, output, op);
+            } else if (type === 1) {
+              if (block.compressedSize < 5) throw new CorruptError("LZMA block has no properties");
+              const props = await read(0, 5);
+              diagnostics.lzmaDecodes += 1;
+              await streamLzma(props, (offset, length) => read(offset + 5, length),
+                block.compressedSize - 5, block.uncompressedSize, output, op);
+            } else {
+              throw new UnsupportedError("compression type", type);
             }
+            if (metadata) {
+              op.check();
+              await op.wait(metadata.publish());
+              op.check();
+            }
+          } catch (cause) {
+            // Abort reasons belong to the caller and may even be frozen.
+            // Other failures gain context through a cause chain, never by
+            // mutating somebody else's error or losing its classification.
+            if (abortSignal?.aborted || !source) throw cause;
+            const context = `UnityFS block ${block.index} at ${block.compressed}`;
+            const reason = cause instanceof Error ? cause.message : String(cause);
+            if (cause instanceof CorruptError) {
+              throw Object.assign(new CorruptError(`${context}: ${reason}`), { cause });
+            }
+            if (cause instanceof UnsupportedError) {
+              throw Object.assign(new UnsupportedError(cause.kind, cause.found,
+                `${context}: ${reason}`), { cause });
+            }
+            throw Object.assign(new Error(`${context}: ${reason}`), { cause });
           }
-          op.check();
-        } finally {
-          op.finish();
-          active = undefined;
         }
-      },
+        op.check();
+      } finally {
+        op.finish();
+        active = undefined;
+      }
+    };
+
+    const api: BundleRangeReader = {
+      header,
+      entries,
+      get diagnostics() { return Object.freeze({ ...diagnostics }); },
+      readRanges: readBatch,
       async readRange(range, abortSignal) {
         if (!source) throw new Error("UnityFS range reader is closed");
         if (active) throw new Error("UnityFS range reader already has an active batch");
@@ -316,26 +354,61 @@ export async function openBundleRange(
         if (unique.size !== files.length) throw new CorruptError("duplicate metadata entry in batch");
         const ordered = [...files].sort((a, b) => selected({ entry: a, offset: 0, length: 0 }).start -
           selected({ entry: b, offset: 0, length: 0 }).start);
+        if (ordered.length === 1 && blocks.length === 1 && (blocks[0]!.flags & 63) === 1) {
+          if (!source) throw new Error("UnityFS range reader is closed");
+          if (active) throw new Error("UnityFS range reader already has an active batch");
+          const entry = ordered[0]!;
+          if (entry.size === 0) throw new CorruptError(`UnityFS ${entry.path}: empty SerializedFile`);
+          let fixed = new Uint8Array(Math.min(48, entry.size));
+          let fixedBytes = 0;
+          let prefix: Uint8Array | undefined;
+          let prefixBytes = 0;
+          // A single LZMA block must decode fully even for a header read. Learn
+          // the bounded prefix extent in that first pass, discard all bodies,
+          // and publish only after the codec has validated its complete output.
+          await readBatch([{ entry, offset: 0, length: entry.size }], () => {}, abortSignal, {
+            collect(bytes, position) {
+              let offset = Math.max(0, entry.offset - position);
+              const end = Math.min(bytes.length, entry.offset + entry.size - position);
+              if (!prefix && offset < end) {
+                const length = Math.min(end - offset, fixed.length - fixedBytes);
+                fixed.set(bytes.subarray(offset, offset + length), fixedBytes);
+                fixedBytes += length;
+                offset += length;
+                diagnostics.deliveredBytes += length;
+                if (fixedBytes === fixed.length) {
+                  const range = metadataRange(entry, fixed);
+                  prefix = new Uint8Array(range.length);
+                  prefixBytes = Math.min(fixed.length, prefix.length);
+                  prefix.set(fixed.subarray(0, prefixBytes));
+                  fixed = new Uint8Array(0);
+                }
+              }
+              if (prefix && prefixBytes < prefix.length && offset < end) {
+                const length = Math.min(end - offset, prefix.length - prefixBytes);
+                prefix.set(bytes.subarray(offset, offset + length), prefixBytes);
+                prefixBytes += length;
+                diagnostics.deliveredBytes += length;
+              }
+            },
+            publish() {
+              if (!prefix || prefixBytes !== prefix.length) {
+                throw new CorruptError(`UnityFS ${entry.path}: incomplete SerializedFile metadata prefix`);
+              }
+              const file = readSerializedFile(prefix, entry.size);
+              prefix = undefined;
+              return consume(entry, file);
+            },
+          });
+          return;
+        }
         const headers = new Map<BundleEntry, Uint8Array>();
         await api.readRanges(ordered.map((entry) => ({ entry, offset: 0, length: Math.min(48, entry.size) })),
           (range, chunk, offset) => {
             if (offset === 0) headers.set(range.entry, new Uint8Array(range.length));
             headers.get(range.entry)!.set(chunk, offset);
           }, abortSignal);
-        const prefixes = ordered.map((entry) => {
-          const fileHeader = readSerializedFileHeader(headers.get(entry) ?? new Uint8Array(0));
-          if (fileHeader.version < 9) {
-            throw new UnsupportedError("range SerializedFile format", fileHeader.version,
-              "prefix acquisition requires format >=9");
-          }
-          const length = (fileHeader.version >= 22 ? 48 : 20) + fileHeader.metadataSize;
-          if (fileHeader.fileSize !== entry.size || length > fileHeader.dataOffset ||
-              fileHeader.dataOffset > entry.size) {
-            throw new CorruptError(`UnityFS ${entry.path}: metadata/file extent disagrees with directory`);
-          }
-          bounded(length, "SerializedFile metadata size");
-          return { entry, offset: 0, length };
-        });
+        const prefixes = ordered.map((entry) => metadataRange(entry, headers.get(entry) ?? new Uint8Array(0)));
         headers.clear();
         // Only one metadata prefix is assembled at once. A batch never retains
         // all selected files, and no object-body bytes are retained with metadata.
