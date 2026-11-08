@@ -146,7 +146,7 @@ for (const obj of env.objects) {
 
 ### Bounded UnityFS reads
 
-`openBundleRange(input, signal?)` reads a UnityFS directory without inflating the whole payload.
+`openBundleRange(input, signal?, options?)` reads a UnityFS directory without inflating the whole payload.
 Its immutable entries identify ranges for that reader instance. `readRanges()` consumes ordered,
 nonoverlapping selections in decoded bundle order, delivering owned chunks of at most 64 KiB to an
 awaited callback; `readRange()` returns one owned span up to 64 MiB. `readMetadata()` retains bounded
@@ -156,6 +156,12 @@ output before publishing metadata to the owned callback; other layouts use separ
 and metadata-prefix phases. `close()` cancels an active read and releases the compressed source
 reference. Keep the input unchanged and available until `close()`. This path does not change the
 synchronous `load()` / `Env` APIs.
+
+`options.taskYieldPolicy` defaults to `"cooperative"`, which yields during range acquisition and
+payload decoding. A caller may explicitly choose `"caller-owned"` to omit those deliberate task
+turns when it owns scheduling outside the operation (for example, in a dedicated worker). This
+does not remove abort checks, required source and consumer awaits, bounds, backpressure or cleanup;
+the caller remains responsible for cancelling or terminating its worker.
 
 Bytes returned by the existing `Env` APIs are views into your input or decompressed blocks, not
 copies. A small view keeps its whole buffer alive, so copy it (`data.slice()`) if you want to keep
@@ -400,7 +406,7 @@ bundled `index.d.ts`, so your editor shows it on hover.
 |---|---|
 | `load(inputs, options?)` | Unpack one file or several and index their objects. Returns an `Env` |
 | `open(sources, options?)` | Fetch or read files (URL, `Request`, `Response`, `Blob` / `File`, bytes), then `load()` them. Returns a promise of the `Env` |
-| `openBundleRange(input, signal?)`, `BundleRangeReader`, `BundleEntry`, `BundleRange` | Read selected UnityFS ranges asynchronously before synchronous metadata/object parsing; ranges belong to the reader instance |
+| `openBundleRange(input, signal?, options?)`, `BundleRangeOptions`, `BundleRangeReader`, `BundleEntry`, `BundleRange` | Read selected UnityFS ranges asynchronously before synchronous metadata/object parsing; `taskYieldPolicy` is cooperative by default or caller-owned when the caller supplies its own scheduling |
 | `BundleRangeConsumer` | Awaited callback for owned chunks of at most 64 KiB; its offset is relative to the requested range. Chunks delivered before a batch fails are provisional, and any retained bytes belong to the caller |
 | `BundleRangeDiagnostics` | Immutable numeric snapshot of metadata decodes, range batches, selected ranges, requested compressed bytes, decoded and delivered bytes, and LZ4/LZMA payload decodes; it contains no retained buffers or trace |
 | `RangeAbortSignal` | Structural cancellation input (`aborted`, optional `reason`, and abort-listener methods), without a DOM type dependency |

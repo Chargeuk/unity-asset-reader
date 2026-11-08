@@ -17,6 +17,7 @@ import {
   RangeOperation,
   readSource,
   type RangeAbortSignal,
+  type RangeTaskDiagnostics,
   type SliceableBlob,
 } from "./rangeIO.js";
 
@@ -45,6 +46,14 @@ export type BundleRangeConsumer = (
   range: BundleRange, bytes: Uint8Array, offset: number,
 ) => void | Promise<void>;
 
+/** Scheduling for this reader's acquisition and payload operations.
+ * Cooperative is the default. Caller-owned omits deliberate task turns only;
+ * the caller must own scheduling/cancellation outside an expensive decode.
+ */
+export interface BundleRangeOptions {
+  readonly taskYieldPolicy?: "cooperative" | "caller-owned";
+}
+
 /** Cumulative acquisition counters, not retained byte buffers or a trace.
  * Codec counts are actual payload invocations, including failed attempts.
  * Bytes decoded include gaps; bytes delivered count only selected owned output.
@@ -61,6 +70,32 @@ export interface BundleRangeDiagnostics {
   readonly deliveredBytes: number;
   readonly lz4Decodes: number;
   readonly lzmaDecodes: number;
+  /** Lifetime stream elapsed includes source I/O, task turns and consumer pressure. */
+  readonly lzmaElapsedMs?: number;
+  readonly lzmaCompleted?: number;
+  readonly lzmaFailed?: number;
+  /** Lifetime consumer/publication elapsed. Selected delivery overlaps codec time;
+   * metadata publication may instead follow completed decoding. */
+  readonly consumerElapsedMs?: number;
+  readonly consumerCalls?: number;
+  /** Latest batch ID and active flag; operation fields reset at the next batch. */
+  readonly operationId?: number;
+  readonly operationActive?: number;
+  readonly operationLzmaDecodes?: number;
+  readonly operationLzmaCompleted?: number;
+  readonly operationLzmaFailed?: number;
+  readonly operationLzmaElapsedMs?: number;
+  readonly operationDecodedBytes?: number;
+  readonly operationConsumerCalls?: number;
+  readonly operationConsumerElapsedMs?: number;
+  readonly operationYieldCalls?: number;
+  readonly operationTurnsStarted?: number;
+  readonly operationTurnsSettled?: number;
+  readonly operationTurnsRejected?: number;
+  readonly operationTurnsPending?: number;
+  readonly operationTurnAwaitMs?: number;
+  readonly operationPortTurns?: number;
+  readonly operationTimerTurns?: number;
 }
 
 /** Selected UnityFS acquisition. Parsing of the resulting bytes stays synchronous. */
@@ -93,6 +128,8 @@ export interface BundleRangeReader {
   close(): void;
 }
 
+declare const performance: { now(): number };
+
 const MAX_OWNED_BYTES = 64 * 1024 * 1024;
 
 function bounded(size: number, what: string): void {
@@ -108,6 +145,8 @@ function bounded(size: number, what: string): void {
  * The compressed source must remain unchanged until close(); its lifetime is
  * caller-owned. Blocks-info and metadata allocations are separately bounded
  * at 64 MiB, independent of the total decoded payload size.
+ * The optional task-yield policy is captured at open; required I/O and consumer
+ * awaits remain under reader ownership in both modes.
  *
  * @throws CorruptError for unsafe sizes, directory/block bounds, truncated data
  * @throws UnsupportedError for legacy containers, encryption or unsupported codecs
@@ -115,14 +154,23 @@ function bounded(size: number, what: string): void {
 export async function openBundleRange(
   input: Uint8Array | SliceableBlob,
   signal?: RangeAbortSignal,
+  options: BundleRangeOptions = {},
 ): Promise<BundleRangeReader> {
+  const taskYieldPolicy = options.taskYieldPolicy ?? "cooperative";
   let source: Uint8Array | SliceableBlob | undefined = input;
   // Do not keep an additional parameter reference after close().
   input = new Uint8Array(0);
-  const operation = new RangeOperation(signal);
+  const operation = new RangeOperation(signal, undefined, taskYieldPolicy);
   let active: RangeOperation | undefined;
   const diagnostics = { blocksInfoDecodes: 0, rangeBatches: 0, ranges: 0, compressedBytesRequested: 0,
-    decodedBytes: 0, deliveredBytes: 0, lz4Decodes: 0, lzmaDecodes: 0 };
+    decodedBytes: 0, deliveredBytes: 0, lz4Decodes: 0, lzmaDecodes: 0,
+    lzmaElapsedMs: 0, lzmaCompleted: 0, lzmaFailed: 0,
+    consumerElapsedMs: 0, consumerCalls: 0 };
+  let operationMetrics: (RangeTaskDiagnostics & {
+    operationLzmaDecodes: number; operationLzmaCompleted: number; operationLzmaFailed: number;
+    operationLzmaElapsedMs: number; operationDecodedBytes: number;
+    operationConsumerCalls: number; operationConsumerElapsedMs: number;
+  }) | undefined;
   try {
     const size = source instanceof Uint8Array ? source.length : source.size;
     if (!Number.isSafeInteger(size) || size < 0) throw new CorruptError("Invalid UnityFS source size");
@@ -227,7 +275,16 @@ export async function openBundleRange(
         }
         previous = span.end;
       }
-      const op = new RangeOperation(abortSignal);
+      // One bounded aggregate for the latest owned batch, never a retained
+      // per-turn trace. Producer/consumer share this operation and its cadence.
+      const metrics = { operationYieldCalls: 0, operationTurnsStarted: 0,
+        operationTurnsSettled: 0, operationTurnsRejected: 0, operationTurnsPending: 0,
+        operationTurnAwaitMs: 0, operationPortTurns: 0, operationTimerTurns: 0,
+        operationLzmaDecodes: 0, operationLzmaCompleted: 0, operationLzmaFailed: 0,
+        operationLzmaElapsedMs: 0, operationDecodedBytes: 0,
+        operationConsumerCalls: 0, operationConsumerElapsedMs: 0 };
+      operationMetrics = metrics;
+      const op = new RangeOperation(abortSignal, metrics, taskYieldPolicy);
       active = op;
       diagnostics.rangeBatches += 1;
       diagnostics.ranges += spans.length;
@@ -240,6 +297,7 @@ export async function openBundleRange(
           let position = block.decoded;
           const output = async (bytes: Uint8Array): Promise<void> => {
             diagnostics.decodedBytes += bytes.length;
+            metrics.operationDecodedBytes += bytes.length;
             if (metadata) {
               // Borrow this transient codec chunk only synchronously. Count
               // copied prefix bytes, not discarded object bodies or gaps.
@@ -257,7 +315,15 @@ export async function openBundleRange(
                 const owned = new Uint8Array(stop - offset);
                 owned.set(bytes.subarray(offset - position, stop - position));
                 diagnostics.deliveredBytes += owned.length;
-                await op.wait(consume(span.range, owned, offset - span.start));
+                const consumerStart = performance.now();
+                diagnostics.consumerCalls += 1;
+                metrics.operationConsumerCalls += 1;
+                try { await op.wait(consume(span.range, owned, offset - span.start)); }
+                finally {
+                  const elapsed = performance.now() - consumerStart;
+                  diagnostics.consumerElapsedMs += elapsed;
+                  metrics.operationConsumerElapsedMs += elapsed;
+                }
                 await op.yield();
               }
             }
@@ -287,8 +353,17 @@ export async function openBundleRange(
                   const owned = new Uint8Array(bytes.length);
                   owned.set(bytes);
                   diagnostics.decodedBytes += bytes.length;
+                  metrics.operationDecodedBytes += bytes.length;
                   diagnostics.deliveredBytes += owned.length;
-                  await op.wait(consume(span.range, owned, offset - span.start));
+                  const consumerStart = performance.now();
+                  diagnostics.consumerCalls += 1;
+                  metrics.operationConsumerCalls += 1;
+                  try { await op.wait(consume(span.range, owned, offset - span.start)); }
+                  finally {
+                    const elapsed = performance.now() - consumerStart;
+                    diagnostics.consumerElapsedMs += elapsed;
+                    metrics.operationConsumerElapsedMs += elapsed;
+                  }
                   await op.yield();
                 }
               }
@@ -299,14 +374,38 @@ export async function openBundleRange(
               if (block.compressedSize < 5) throw new CorruptError("LZMA block has no properties");
               const props = await read(0, 5);
               diagnostics.lzmaDecodes += 1;
-              await streamLzma(props, (offset, length) => read(offset + 5, length),
-                block.compressedSize - 5, block.uncompressedSize, output, op);
+              metrics.operationLzmaDecodes += 1;
+              // Inclusive stream elapsed is deliberately separate from task and
+              // consumer waits. These overlap and must never be summed as CPU.
+              const start = performance.now();
+              try {
+                await streamLzma(props, (offset, length) => read(offset + 5, length),
+                  block.compressedSize - 5, block.uncompressedSize, output, op);
+                diagnostics.lzmaCompleted += 1;
+                metrics.operationLzmaCompleted += 1;
+              } catch (error) {
+                diagnostics.lzmaFailed += 1;
+                metrics.operationLzmaFailed += 1;
+                throw error;
+              } finally {
+                const elapsed = performance.now() - start;
+                diagnostics.lzmaElapsedMs += elapsed;
+                metrics.operationLzmaElapsedMs += elapsed;
+              }
             } else {
               throw new UnsupportedError("compression type", type);
             }
             if (metadata) {
               op.check();
-              await op.wait(metadata.publish());
+              const consumerStart = performance.now();
+              diagnostics.consumerCalls += 1;
+              metrics.operationConsumerCalls += 1;
+              try { await op.wait(metadata.publish()); }
+              finally {
+                const elapsed = performance.now() - consumerStart;
+                diagnostics.consumerElapsedMs += elapsed;
+                metrics.operationConsumerElapsedMs += elapsed;
+              }
               op.check();
             }
           } catch (cause) {
@@ -336,7 +435,8 @@ export async function openBundleRange(
     const api: BundleRangeReader = {
       header,
       entries,
-      get diagnostics() { return Object.freeze({ ...diagnostics }); },
+      get diagnostics() { return Object.freeze({ ...diagnostics, ...operationMetrics,
+        operationId: diagnostics.rangeBatches, operationActive: Number(!!active) }); },
       readRanges: readBatch,
       async readRange(range, abortSignal) {
         if (!source) throw new Error("UnityFS range reader is closed");

@@ -252,14 +252,17 @@ test("cancelling active waits settles each once and observes later input outcome
   } finally { operation.finish(); }
 });
 
-test("incremental raw decoder rejects truncated, short-size and oversized-dictionary input", async () => {
+// Removing deliberate turns must not relax the codec's byte validation or its
+// ownership of pending source and consumer promises.
+for (const taskYieldPolicy of [undefined, "caller-owned"] as const) {
+test(`incremental raw decoder rejects truncated, short-size and oversized-dictionary input${taskYieldPolicy ? ` (${taskYieldPolicy})` : ""}`, async () => {
   for (const [props, input, size, error] of [
     [PROPS_5D, STREAM_5D.subarray(0, 12), 512, CorruptError],
     [PROPS_5D, STREAM_5D, 1024, CorruptError],
     [PROPS_5D, STREAM_5D, 100, CorruptError],
     [hex("5dffffffff"), STREAM_5D, 512, UnsupportedError],
   ] as const) {
-    const operation = new RangeOperation();
+    const operation = new RangeOperation(undefined, undefined, taskYieldPolicy);
     try {
       await assert.rejects(streamLzma(props, async (at, length) => input.slice(at, at + length),
         input.length, size, async () => {}, operation), error);
@@ -269,12 +272,12 @@ test("incremental raw decoder rejects truncated, short-size and oversized-dictio
   }
 });
 
-test("incremental raw decoder cancels stalled input, consumer and a large in-flight stream", async () => {
+test(`incremental raw decoder cancels stalled input, consumer and a large in-flight stream${taskYieldPolicy ? ` (${taskYieldPolicy})` : ""}`, async () => {
   for (const where of ["before", "input", "consumer", "turn"] as const) {
     const abort = new AbortController();
     const reason = new Error(`cancel ${where}`);
     if (where === "before") abort.abort(reason);
-    const operation = new RangeOperation(abort.signal);
+    const operation = new RangeOperation(abort.signal, undefined, taskYieldPolicy);
     const size = where === "turn" ? 4 * 1024 * 1024 : PAYLOAD.length;
     const container = where === "turn" ? compress(new Uint8Array(size).fill(65), {
       dictSize: 524288,
@@ -311,6 +314,7 @@ test("incremental raw decoder cancels stalled input, consumer and a large in-fli
     }
   }
 });
+}
 
 test("range task turns preserve concurrent waits, queued cancellation, worker messages and timer fallback", () => {
   const io = new URL("../src/bundle/rangeIO.ts", import.meta.url).href;
@@ -422,7 +426,8 @@ console.log(JSON.stringify({channels,closes,workerCalls:reply.calls,timers}));
   assert.equal(result.status, 0, [result.stderr, result.stdout, String(result.error)].join("\n"));
 });
 
-test("48 MiB one-block expansion bounds native queues and releases completed waits/output before finish", () => {
+for (const taskYieldPolicy of [undefined, "caller-owned"] as const) {
+test(`48 MiB one-block expansion bounds native queues and releases completed waits/output before finish${taskYieldPolicy ? ` (${taskYieldPolicy})` : ""}`, () => {
   // The expected bytes are specified independently (48 MiB of ASCII A). The
   // upstream encoder only writes this owned stress fixture, never its golden.
   // The smaller fixed vectors above are independent liblzma compatibility proof.
@@ -576,7 +581,8 @@ const RangeOperation=ioModule.RangeOperation??ioModule.default?.RangeOperation;
 assert.equal(typeof streamLzma,'function');
 assert.equal(typeof RangeOperation,'function');
 const bytes=Uint8Array.from(Buffer.from(${JSON.stringify(Buffer.from(container).toString("base64"))},'base64'));
-const operation=new RangeOperation();
+const taskYieldPolicy=${JSON.stringify(taskYieldPolicy) ?? "undefined"};
+const operation=new RangeOperation(undefined,undefined,taskYieldPolicy);
 // An explicit root prevents the operation itself from becoming collectible:
 // completed bytes must release while its cancellation machinery stays alive.
 globalThis.retainedRangeOperation=operation;
@@ -647,7 +653,7 @@ try {
   const schedulingBytes=compress(schedulingInput,{dictSize:524288});
   assert.ok(schedulingBytes.length>schedulingInput.length/2,
     'scheduling fixture must exercise compressed input, not just expansion');
-  const schedulingOperation=new RangeOperation();
+  const schedulingOperation=new RangeOperation(undefined,undefined,taskYieldPolicy);
   observeOperation(schedulingOperation);
   let expectedState=0x6601, schedulingTotal=0;
   try {
@@ -667,7 +673,9 @@ try {
       assert.equal(record.readBytes,record.expectedOutputBytes);
       assert.equal(record.writeCalls,Math.ceil(record.inputBytes/16));
       assert.equal(record.transformCalls,record.writeCalls);
-      assert.equal(record.yieldMessages+record.yieldTimers,Math.floor(record.yieldCalls/64));
+      assert.ok(record.yieldCalls>0,'turn suppression must not erase actual codec calls');
+      assert.equal(record.yieldMessages+record.yieldTimers,
+        taskYieldPolicy==='caller-owned'?0:Math.floor(record.yieldCalls/64));
       assert.equal(record.yieldTimers,0,'native channel turns must not schedule nested timers');
       assert.ok(record.peakQueuedBytes<=2*512*273*(16+64+1)+524288);
       for(const [key,value] of Object.entries(record)) {
@@ -675,7 +683,8 @@ try {
       }
     }
   } finally {schedulingOperation.finish();}
-  assert.equal(channels,2,'one lazy channel per operation');
+  assert.equal(channels,taskYieldPolicy==='caller-owned'?0:2,
+    'only cooperative operations create lazy task channels');
   assert.equal(closedPorts,2*channels,'finish releases both ports exactly once');
   console.log(JSON.stringify({total,peak,maximumCurrent,waitRetained,outputRetained,timings}));
 } finally {
@@ -696,3 +705,4 @@ try {
   // aggregates through the existing test output without creating a trace file.
   console.log(result.stderr);
 });
+}

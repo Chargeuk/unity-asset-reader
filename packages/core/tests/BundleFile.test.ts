@@ -3,9 +3,11 @@ import { test } from "node:test";
 import { createHash } from "node:crypto";
 import { compress } from "lzma1";
 import { openBundleRange } from "../src/bundle/BundleRangeReader.js";
+import { RangeOperation, type RangeTaskDiagnostics } from "../src/bundle/rangeIO.js";
 import { ObjectReader } from "../src/serialized/ObjectReader.js";
 import type { ObjectInfo, SerializedFile } from "../src/serialized/SerializedFile.js";
 import type { BundleEntry } from "../src/bundle/BundleRangeReader.js";
+import type { BundleRangeOptions } from "../src/index.js";
 
 import {
   assertMatchesGolden,
@@ -1082,10 +1084,14 @@ for (const layout of ["stored", "lz4", "multiple-files", "multiple-blocks"] as c
   });
 }
 
-test("single LZMA metadata holds active ownership through awaited publication and preserves consumer causes", async () => {
+// Scheduling ownership must not weaken metadata publication, backpressure or
+// abort/close handling. Reuse the same fixtures and lifecycle assertions.
+for (const taskYieldPolicy of [undefined, "caller-owned"] as const) {
+test(`single LZMA metadata holds active ownership through awaited publication and preserves consumer causes${taskYieldPolicy ? ` (${taskYieldPolicy})` : ""}`, async () => {
   const fixture = metadataFixture();
   const reader = await openBundleRange(buildBundle({blocks: [{data: metadataLzma(fixture.bytes), flags: 1,
-    uncompressedSize: fixture.bytes.length}], nodes: [{path: "CAB-owned", offset: 0, size: fixture.bytes.length}]}));
+    uncompressedSize: fixture.bytes.length}], nodes: [{path: "CAB-owned", offset: 0, size: fixture.bytes.length}]}),
+    undefined, {taskYieldPolicy});
   const entry = reader.entries[0]!;
   let release!: () => void, entered!: () => void;
   const started = new Promise<void>((resolve) => { entered = resolve; });
@@ -1115,7 +1121,7 @@ test("single LZMA metadata holds active ownership through awaited publication an
 
 for (const phase of ["before", "acquisition", "decode", "consumer"] as const) {
   for (const action of ["abort", "close"] as const) {
-    test(`single LZMA metadata ${action} during ${phase} observes late rejections and settles its batch`, async () => {
+    test(`single LZMA metadata ${action} during ${phase} observes late rejections and settles its batch${taskYieldPolicy ? ` (${taskYieldPolicy})` : ""}`, async () => {
       const fixture = metadataFixture(17, phase === "decode" ? 192 * 1024 : 4);
       if (phase === "decode") {
         // Independent xorshift bytes force multiple compressed acquisitions;
@@ -1142,7 +1148,7 @@ for (const phase of ["before", "acquisition", "decode", "consumer"] as const) {
           }
           return Promise.resolve(bundle.slice(start, end).buffer);
         }};
-      }});
+      }}, undefined, {taskYieldPolicy});
       const abort = new AbortController(), reason = Object.freeze(new Error("owned metadata cancelled"));
       let calls = 0;
       const unhandled: unknown[] = [];
@@ -1181,12 +1187,17 @@ for (const phase of ["before", "acquisition", "decode", "consumer"] as const) {
     });
   }
 }
+}
 
+// Both public policies decode the same bytes; only deliberate turn accounting
+// changes. An omitted option must retain the cooperative cadence too.
+for (const taskYieldPolicy of [undefined, "cooperative", "caller-owned"] as const) {
 for (const [name, codec] of [["lz4.bundle", "lz4"], ["lzma.bundle", "lzma"], ["uncompressed.bundle", "stored"]] as const) {
-  test(`range diagnostics count actual ${codec} invocations and owned bytes across repeated batches`, async () => {
+  test(`range diagnostics count actual ${codec} invocations and owned bytes across repeated batches${taskYieldPolicy ? ` (${taskYieldPolicy})` : ""}`, async () => {
     // These existing writer fixtures contain one payload block. Its CAB begins
     // with SHA256("<stem>:cab") in make-fixtures.py, independent of this parser.
-    const reader = await openBundleRange(loadFixture(name));
+    const options: BundleRangeOptions | undefined = taskYieldPolicy ? {taskYieldPolicy} : undefined;
+    const reader = await openBundleRange(loadFixture(name), undefined, options);
     try {
       const stem = name.slice(0, -".bundle".length);
       const entry = reader.entries.find((item) => item.path === `CAB-${stem}`)!;
@@ -1200,11 +1211,39 @@ for (const [name, codec] of [["lz4.bundle", "lz4"], ["lzma.bundle", "lzma"], ["u
       assert.equal(snapshot.blocksInfoDecodes, codec === "stored" ? 0 : 1);
       assert.equal(snapshot.lz4Decodes, codec === "lz4" ? 1 : 0);
       assert.equal(snapshot.lzmaDecodes, codec === "lzma" ? 1 : 0);
+      assert.equal(snapshot.operationId, 1);
+      assert.equal(snapshot.operationActive, 0);
+      assert.equal(snapshot.operationLzmaDecodes, codec === "lzma" ? 1 : 0);
+      assert.equal(snapshot.operationLzmaCompleted, codec === "lzma" ? 1 : 0);
+      assert.equal(snapshot.operationLzmaFailed, 0);
+      assert.equal(snapshot.operationDecodedBytes, snapshot.decodedBytes);
+      assert.equal(snapshot.operationConsumerCalls, 1);
+      assert.equal(snapshot.operationTurnsPending, 0);
+      assert.equal(snapshot.operationTurnsRejected, 0);
+      assert.ok(snapshot.operationYieldCalls! > 0, "both policies retain work-site call counts");
+      assert.equal(snapshot.operationTurnsStarted,
+        taskYieldPolicy === "caller-owned" ? 0 : Math.floor(snapshot.operationYieldCalls! / 64));
+      assert.equal(snapshot.operationTurnsSettled, snapshot.operationTurnsStarted);
+      assert.equal(snapshot.operationPortTurns! + snapshot.operationTimerTurns!, snapshot.operationTurnsStarted);
+      if (taskYieldPolicy === "caller-owned") assert.equal(snapshot.operationTurnAwaitMs, 0);
+      assert.equal(snapshot.consumerCalls, 1);
+      assert.equal(snapshot.lzmaCompleted, codec === "lzma" ? 1 : 0);
+      assert.equal(snapshot.lzmaFailed, 0);
+      assert.ok(snapshot.consumerElapsedMs! >= 0);
+      assert.ok(snapshot.lzmaElapsedMs! >= 0);
       assert.ok(snapshot.compressedBytesRequested > 0);
       const second = await reader.readRange({ entry, offset: 0, length: 1 });
       assert.deepEqual(second, first);
       assert.notEqual(second.buffer, first.buffer);
       assert.equal(reader.diagnostics!.rangeBatches, 2);
+      assert.equal(reader.diagnostics!.operationId, 2);
+      assert.equal(reader.diagnostics!.operationLzmaDecodes, codec === "lzma" ? 1 : 0);
+      assert.equal(reader.diagnostics!.operationDecodedBytes, snapshot.operationDecodedBytes);
+      assert.equal(reader.diagnostics!.operationConsumerCalls, 1);
+      assert.equal(reader.diagnostics!.operationYieldCalls, snapshot.operationYieldCalls,
+        "latest operation counters reset; lifetime byte/codec counters accumulate");
+      assert.equal(reader.diagnostics!.consumerCalls, 2);
+      assert.equal(reader.diagnostics!.lzmaCompleted, codec === "lzma" ? 2 : 0);
       assert.equal(reader.diagnostics!.deliveredBytes, 2);
       assert.equal(reader.diagnostics!.lz4Decodes, codec === "lz4" ? 2 : 0);
       assert.equal(reader.diagnostics!.lzmaDecodes, codec === "lzma" ? 2 : 0);
@@ -1212,6 +1251,92 @@ for (const [name, codec] of [["lz4.bundle", "lz4"], ["lzma.bundle", "lzma"], ["u
       assert.equal(reader.diagnostics!.decodedBytes, snapshot.decodedBytes * 2);
     } finally { reader.close(); }
   });
+}
+}
+
+for (const channel of ["port", "timer"] as const) {
+  test(`optional task accounting preserves 64 shared calls, concurrent settlement and cancellation via ${channel}`, async () => {
+    const original = Object.getOwnPropertyDescriptor(globalThis, "MessageChannel");
+    if (channel === "timer") Object.defineProperty(globalThis, "MessageChannel", {value: undefined, configurable: true});
+    const counters: RangeTaskDiagnostics = {operationYieldCalls: 0, operationTurnsStarted: 0,
+      operationTurnsSettled: 0, operationTurnsRejected: 0, operationTurnsPending: 0,
+      operationTurnAwaitMs: 0, operationPortTurns: 0, operationTimerTurns: 0};
+    const operation = new RangeOperation(undefined, counters);
+    try {
+      for (let i = 0; i < 63; i++) await operation.yield();
+      assert.equal(counters.operationYieldCalls, 63);
+      assert.equal(counters.operationTurnsStarted, 0);
+      const first = operation.yield();
+      for (let i = 0; i < 63; i++) await operation.yield();
+      const second = operation.yield();
+      await Promise.all([first, second]);
+      assert.equal(counters.operationYieldCalls, 128);
+      assert.equal(counters.operationTurnsStarted, 2);
+      assert.equal(counters.operationTurnsSettled, 2);
+      assert.equal(counters.operationTurnsPending, 0);
+      for (let i = 0; i < 63; i++) await operation.yield();
+      const cancelled = operation.yield();
+      const reason = Object.freeze(new Error("queued task cancelled"));
+      operation.cancel(reason);
+      await assert.rejects(cancelled, (cause: unknown) => cause === reason);
+      assert.equal(counters.operationYieldCalls, 192);
+      assert.equal(counters.operationTurnsStarted, 3);
+      assert.equal(counters.operationTurnsSettled, 2);
+      assert.equal(counters.operationTurnsRejected, 1);
+      assert.equal(counters.operationTurnsPending, 0);
+      assert.equal(counters.operationPortTurns, channel === "port" ? 3 : 0);
+      assert.equal(counters.operationTimerTurns, channel === "timer" ? 3 : 0);
+      assert.ok(counters.operationTurnAwaitMs >= 0);
+    } finally {
+      operation.finish();
+      if (original) Object.defineProperty(globalThis, "MessageChannel", original);
+      else Reflect.deleteProperty(globalThis, "MessageChannel");
+    }
+  });
+}
+
+for (const taskYieldPolicy of [undefined, "caller-owned"] as const) {
+for (const outcome of ["success", "reject", "abort", "close"] as const) {
+  test(`range diagnostic ownership survives a pending consumer and ${outcome}${taskYieldPolicy ? ` (${taskYieldPolicy})` : ""}`, async () => {
+    const reader = await openBundleRange(loadFixture("lzma.bundle"), undefined, {taskYieldPolicy});
+    const controller = new AbortController();
+    const reason = Object.freeze(new Error("owned pending consumer"));
+    let entered!: () => void;
+    const started = new Promise<void>((resolve) => { entered = resolve; });
+    let release!: () => void;
+    let reject!: (cause: unknown) => void;
+    const consumer = new Promise<void>((resolve, fail) => { release = resolve; reject = fail; });
+    const pending = reader.readRanges([{entry: reader.entries[0]!, offset: 0, length: 1}],
+      () => { entered(); return consumer; }, controller.signal);
+    // Observe eagerly, including rejection after close/abort wins the owned race.
+    const observed = pending.then(() => undefined, (cause: unknown) => cause);
+    try {
+      await started;
+      const live = reader.diagnostics!;
+      assert.equal(live.operationId, 1);
+      assert.equal(live.operationActive, 1);
+      assert.equal(live.consumerCalls, 1);
+      assert.equal(live.lzmaDecodes, 1);
+      assert.equal(live.lzmaCompleted, 0);
+      await assert.rejects(reader.readRanges([], () => {}), /active batch/);
+      if (outcome === "abort") controller.abort(reason);
+      else if (outcome === "close") reader.close();
+      else if (outcome === "reject") reject(reason);
+      else release();
+      const failure = await observed;
+      if (outcome === "success") assert.equal(failure, undefined);
+      else if (outcome === "abort") assert.equal(failure, reason);
+      else assert.ok(failure instanceof Error);
+      assert.equal(reader.diagnostics!.operationActive, 0);
+      assert.equal(reader.diagnostics!.operationTurnsPending, 0);
+      assert.equal(reader.diagnostics!.lzmaCompleted, outcome === "success" ? 1 : 0);
+      assert.equal(reader.diagnostics!.lzmaFailed, outcome === "success" ? 0 : 1);
+      assert.ok(reader.diagnostics!.consumerElapsedMs! >= 0);
+      assert.equal(live.operationActive, 1, "live snapshot was immutable, not retained mutable state");
+      if (outcome === "abort" || outcome === "close") reject(reason);
+    } finally { release(); reader.close(); await observed; }
+  });
+}
 }
 
 for (const name of [...UNITYFS_FIXTURES, ...STRIPPED_FIXTURES]) {
@@ -1288,14 +1413,15 @@ test("selected spans cross stored/LZ4/LZMA block boundaries without retaining th
   } finally { reader.close(); }
 });
 
-test("large single LZMA block selected ranges preserve exact bytes through slow consumption", async () => {
+for (const taskYieldPolicy of [undefined, "caller-owned"] as const) {
+test(`large single LZMA block selected ranges preserve exact bytes through slow consumption${taskYieldPolicy ? ` (${taskYieldPolicy})` : ""}`, async () => {
   const size = 6 * 1024 * 1024;
   const container = compress(new Uint8Array(size).fill(71), { dictSize: 524288 });
   const raw = Uint8Array.from([...container.subarray(0, 5), ...container.subarray(13)]);
   const reader = await openBundleRange(buildBundle({
     blocks: [{ data: raw, flags: 1, uncompressedSize: size }],
     nodes: [{ path: "large-lzma", offset: 0, size }],
-  }));
+  }), undefined, {taskYieldPolicy});
   try {
     const entry = reader.entries[0]!;
     let count = 0;
@@ -1308,13 +1434,28 @@ test("large single LZMA block selected ranges preserve exact bytes through slow 
         await new Promise((resolve) => setTimeout(resolve, 1));
       });
     assert.equal(count, 2 * 131073);
+    const measured = reader.diagnostics!;
+    assert.equal(measured.lzmaDecodes, 1);
+    assert.equal(measured.lzmaCompleted, 1);
+    assert.equal(measured.operationDecodedBytes, size);
+    assert.ok(measured.operationYieldCalls! >= 64, "actual stream work still reaches yield sites");
+    if (taskYieldPolicy === "caller-owned") assert.equal(measured.operationTurnsStarted, 0);
+    else assert.ok(measured.operationTurnsStarted! > 0, "real stream work takes owned task turns");
+    assert.equal(measured.operationTurnsStarted,
+      taskYieldPolicy === "caller-owned" ? 0 : Math.floor(measured.operationYieldCalls! / 64));
+    assert.equal(measured.operationTurnsSettled, measured.operationTurnsStarted);
+    assert.equal(measured.operationTurnsPending, 0);
+    assert.ok(measured.lzmaElapsedMs! >= measured.consumerElapsedMs!,
+      "consumer elapsed is nested in inclusive stream time, not an additional CPU interval");
   } finally { reader.close(); }
 });
+}
 
-test("range entry identity, order, extents, corrupt codec and closed ownership fail explicitly", async () => {
+for (const taskYieldPolicy of [undefined, "caller-owned"] as const) {
+test(`range entry identity, order, extents, corrupt codec and closed ownership fail explicitly${taskYieldPolicy ? ` (${taskYieldPolicy})` : ""}`, async () => {
   const data = buildBundle();
-  const first = await openBundleRange(data);
-  const second = await openBundleRange(data);
+  const first = await openBundleRange(data, undefined, {taskYieldPolicy});
+  const second = await openBundleRange(data, undefined, {taskYieldPolicy});
   const entry = first.entries[0]!;
   try {
     for (const bad of [
@@ -1337,18 +1478,18 @@ test("range entry identity, order, extents, corrupt codec and closed ownership f
   ]) {
     let reader;
     try {
-      reader = await openBundleRange(malformed);
+      reader = await openBundleRange(malformed, undefined, {taskYieldPolicy});
       await assert.rejects(reader.readRange({ entry: reader.entries[0]!, offset: 0, length: 64 }), CorruptError);
     } catch (error) { assert.ok(error instanceof CorruptError); }
     finally { reader?.close(); }
   }
 });
 
-test("range cancellation closes stalled acquisition and never calls the consumer again", async () => {
+test(`range cancellation closes stalled acquisition and never calls the consumer again${taskYieldPolicy ? ` (${taskYieldPolicy})` : ""}`, async () => {
   const data = buildBundle({ blocks: [{ data: payload(200000) }],
     nodes: [{ path: "large", offset: 0, size: 200000 }] });
   const abort = new AbortController();
-  const reader = await openBundleRange(data);
+  const reader = await openBundleRange(data, undefined, {taskYieldPolicy});
   let calls = 0;
   try {
     const selection = { entry: reader.entries[0]!, offset: 0, length: 200000 };
@@ -1364,7 +1505,7 @@ test("range cancellation closes stalled acquisition and never calls the consumer
       (error: unknown) => error === reason);
     assert.equal(calls, 1);
   } finally { reader.close(); }
-  const closed = await openBundleRange(data);
+  const closed = await openBundleRange(data, undefined, {taskYieldPolicy});
   await assert.rejects(closed.readRanges([
     { entry: closed.entries[0]!, offset: 0, length: 200000 },
   ], async () => {
@@ -1374,11 +1515,13 @@ test("range cancellation closes stalled acquisition and never calls the consumer
   await assert.rejects(closed.readRange({ entry: closed.entries[0]!, offset: 0, length: 1 }), /closed/);
   const stalled = new AbortController();
   const opened = openBundleRange({ size: data.length,
-    slice() { return { arrayBuffer: () => new Promise<ArrayBuffer>(() => {}) }; } }, stalled.signal);
+    slice() { return { arrayBuffer: () => new Promise<ArrayBuffer>(() => {}) }; } }, stalled.signal,
+    {taskYieldPolicy});
   const reason = new Error("source cancelled");
   stalled.abort(reason);
   await assert.rejects(opened, (error: unknown) => error === reason);
 });
+}
 
 test("batch metadata and selected object spans retain public absolute identity and oracle values", async () => {
   const name = "editor/2020.3.30f1/lzma/shared";

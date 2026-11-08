@@ -16,6 +16,24 @@ export interface SliceableBlob {
 
 // All target runtimes supply timers; only this structural member is used.
 declare function setTimeout(callback: () => void, delay: number): unknown;
+// Monotonic clock supplied by the supported Node/browser runtimes; no DOM types.
+declare const performance: { now(): number };
+
+/** Internal optional numeric accounting for one owned range operation.
+ * Turn elapsed is logical waiting through settlement/cancellation, not CPU time
+ * or confirmation that a cancelled underlying task physically completed.
+ * Concurrent producer/consumer turn waits may overlap; their elapsed is a sum.
+ */
+export interface RangeTaskDiagnostics {
+  operationYieldCalls: number;
+  operationTurnsStarted: number;
+  operationTurnsSettled: number;
+  operationTurnsRejected: number;
+  operationTurnsPending: number;
+  operationTurnAwaitMs: number;
+  operationPortTurns: number;
+  operationTimerTurns: number;
+}
 
 // Locally typed WHATWG ports keep DOM/Node declarations out of core's API.
 interface TaskPort {
@@ -39,7 +57,9 @@ export class RangeOperation {
   private readonly turns: Array<() => void> = [];
   private readonly onAbort = (): void => this.cancel(this.signal?.reason);
 
-  constructor(private readonly signal?: RangeAbortSignal) {
+  constructor(private readonly signal?: RangeAbortSignal,
+    private readonly diagnostics?: RangeTaskDiagnostics,
+    private readonly taskYieldPolicy: "cooperative" | "caller-owned" = "cooperative") {
     signal?.addEventListener("abort", this.onAbort, { once: true });
     if (signal?.aborted) this.onAbort();
   }
@@ -89,25 +109,46 @@ export class RangeOperation {
 
   async yield(): Promise<void> {
     this.check();
-    // Keep a real task turn every 64 shared producer/consumer calls: promise-only
+    // By default keep a real turn every 64 producer/consumer calls: promise-only
     // chains starve abort messages. Nested timers imposed ~4 ms per turn in the
     // retained Epi trace. A port task has no timer-nesting floor and carries no
-    // source bytes; cadence, codec writes and awaited backpressure stay unchanged.
-    if (++this.ticks % 64 === 0) {
-      await this.wait(new Promise<void>((resolve) => {
-        if (typeof MessageChannel === "undefined") {
-          setTimeout(resolve, 0);
-          return;
+    // source bytes. Caller-owned scheduling omits these deliberate turns only;
+    // retain checks/call counts and every required codec/I/O/consumer await.
+    const diagnostics = this.diagnostics;
+    if (diagnostics) diagnostics.operationYieldCalls += 1;
+    if (++this.ticks % 64 === 0 && this.taskYieldPolicy !== "caller-owned") {
+      const start = diagnostics ? performance.now() : undefined;
+      if (diagnostics) {
+        diagnostics.operationTurnsStarted += 1;
+        diagnostics.operationTurnsPending += 1;
+      }
+      try {
+        await this.wait(new Promise<void>((resolve) => {
+          if (typeof MessageChannel === "undefined") {
+            if (diagnostics) diagnostics.operationTimerTurns += 1;
+            setTimeout(resolve, 0);
+            return;
+          }
+          if (diagnostics) diagnostics.operationPortTurns += 1;
+          if (!this.taskChannel) {
+            this.taskChannel = new MessageChannel();
+            this.taskChannel.port1.onmessage = () => { this.turns.shift()?.(); };
+          }
+          // Producer and consumer can both await turns. Each posted task owns its
+          // resolver; overwriting a single callback would strand the other waiter.
+          this.turns.push(resolve);
+          this.taskChannel.port2.postMessage(null);
+        }));
+        if (diagnostics) diagnostics.operationTurnsSettled += 1;
+      } catch (error) {
+        if (diagnostics) diagnostics.operationTurnsRejected += 1;
+        throw error;
+      } finally {
+        if (diagnostics) {
+          diagnostics.operationTurnsPending -= 1;
+          diagnostics.operationTurnAwaitMs += performance.now() - start!;
         }
-        if (!this.taskChannel) {
-          this.taskChannel = new MessageChannel();
-          this.taskChannel.port1.onmessage = () => { this.turns.shift()?.(); };
-        }
-        // Producer and consumer can both await turns. Each posted task owns its
-        // resolver; overwriting a single callback would strand the other waiter.
-        this.turns.push(resolve);
-        this.taskChannel.port2.postMessage(null);
-      }));
+      }
     }
   }
 

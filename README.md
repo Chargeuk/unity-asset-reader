@@ -9,6 +9,29 @@ browse its contents, and preview its textures and sprites.
 The parser is written in TypeScript. Compressed texture decoding uses WebAssembly.
 You do not need Unity, .NET, or a native application installed.
 
+Selected UnityFS reader diagnostics are bounded numeric snapshots. Byte/codec/consumer
+counters and LZMA stream elapsed are cumulative reader-lifetime values; `operationId`
+identifies the latest batch and its `operation*` counters reset for each batch,
+including actual LZMA attempts/completions/failures, decoded bytes and consumer elapsed.
+A positive lifetime LZMA count alone does not establish work in the current batch.
+`operationActive` includes awaited consumers. Task counts distinguish started,
+settled, rejected and pending logical turns, with actual port/timer counts. Turn
+elapsed ends on logical settlement/cancellation, not physical task cancellation.
+LZMA stream elapsed includes acquisition, task waits and selected-consumer pressure;
+metadata publication may instead follow decoding. Concurrent turn waits may overlap.
+These elapsed values cannot be summed/subtracted to infer exclusive CPU time.
+
+`openBundleRange(input, signal?, options?)` accepts
+`{ taskYieldPolicy?: "cooperative" | "caller-owned" }` (`BundleRangeOptions`).
+The default `cooperative` policy retains one real task turn every 64 shared
+producer/consumer yield calls. `caller-owned` omits only deliberate port/timer
+turns, for an owner that supplies scheduling and physical worker cancellation.
+Abort checks, required I/O/codec/consumer awaits, backpressure and byte bounds
+remain unchanged. The policy is captured when opening the reader. Yield-call
+counters still count work-site calls in caller-owned mode; deliberate task-turn
+counters are zero, which does not imply zero decoding or consumer work. Required
+awaits alone do not guarantee queued task/message delivery during one long decode.
+
 ## Choose your packages
 
 | What you need | Packages |

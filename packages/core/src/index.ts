@@ -218,5 +218,6 @@ export type { SpriteAtlas, SpriteAtlasData, SpriteInstanceData } from "./classes
 export { openBundleRange } from "./bundle/BundleRangeReader.js";
 export type {
   BundleEntry, BundleRange, BundleRangeConsumer, BundleRangeReader, BundleRangeDiagnostics,
+  BundleRangeOptions,
 } from "./bundle/BundleRangeReader.js";
 export type { RangeAbortSignal, SliceableBlob } from "./bundle/rangeIO.js";
