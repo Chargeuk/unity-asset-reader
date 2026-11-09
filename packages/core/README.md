@@ -408,7 +408,7 @@ bundled `index.d.ts`, so your editor shows it on hover.
 | `open(sources, options?)` | Fetch or read files (URL, `Request`, `Response`, `Blob` / `File`, bytes), then `load()` them. Returns a promise of the `Env` |
 | `openBundleRange(input, signal?, options?)`, `BundleRangeOptions`, `BundleRangeReader`, `BundleEntry`, `BundleRange` | Read selected UnityFS ranges asynchronously before synchronous metadata/object parsing; `taskYieldPolicy` is cooperative by default or caller-owned when the caller supplies its own scheduling |
 | `BundleRangeConsumer` | Awaited callback for owned chunks of at most 64 KiB; its offset is relative to the requested range. Chunks delivered before a batch fails are provisional, and any retained bytes belong to the caller |
-| `BundleRangeDiagnostics` | Immutable numeric snapshot of metadata decodes, range batches, selected ranges, requested compressed bytes, decoded and delivered bytes, and LZ4/LZMA payload decodes; it contains no retained buffers or trace |
+| `BundleRangeDiagnostics` | Immutable numeric snapshot of metadata decodes, range batches, selected ranges, requested compressed bytes, decoded and delivered bytes, LZ4/LZMA payload decodes, and latest-operation LZMA input chunk and phase metrics; see the repository README for their limits. It contains no retained buffers or trace |
 | `RangeAbortSignal` | Structural cancellation input (`aborted`, optional `reason`, and abort-listener methods), without a DOM type dependency |
 | `SliceableBlob` | Structural source input (`size` and `slice(start, end).arrayBuffer()`) for bounded reads from a caller-owned source, without a DOM type dependency |
 | `OpenSource`, `OpenOptions` | What `open()` takes; options include `LoadOptions` and a `fetch` replacing the global one |

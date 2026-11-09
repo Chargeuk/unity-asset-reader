@@ -24,6 +24,9 @@ import { decompressRawLzma1, DecompressRawLzma1, MemoryLimitError } from "lzma1"
 
 import { CorruptError, UnsupportedError } from "../errors.js";
 
+// Supported Node/browser runtimes supply this monotonic clock without DOM types.
+declare const performance: { now(): number };
+
 /** Property bytes: the packed `lc`/`lp`/`pb` byte, then a u32 dictionary size. */
 const PROPS_SIZE = 5;
 
@@ -141,6 +144,11 @@ interface RawStream {
  * pending+concatenated compressed data cost at most 2*(64+16) bytes.
  * Refuse properties whose conservative transient bound exceeds 64 MiB;
  * this is a decoder-resource bound, never a decoded-file-size cutoff.
+ * Optional per-operation accounting clocks only whole input chunks so observing
+ * acquisition versus feeding does not add timing work to every 16-byte write.
+ * Failed/cancelled phase elapsed ends at logical settlement; unfinished phases
+ * are absent from live elapsed totals. Feed time includes stream pressure and
+ * yields, overlapping output/consumer work, not exclusive decoder CPU time.
  */
 export async function streamLzma(
   props: Uint8Array,
@@ -149,6 +157,13 @@ export async function streamLzma(
   uncompressedSize: number,
   consume: import("../bundle/rangeIO.js").DecodedConsumer,
   operation: import("../bundle/rangeIO.js").RangeOperation,
+  diagnostics?: {
+    operationLzmaInputChunksStarted: number;
+    operationLzmaInputChunksAcquired: number;
+    operationLzmaInputChunksFed: number;
+    operationLzmaInputAcquireMs: number;
+    operationLzmaFeedMs: number;
+  },
 ): Promise<void> {
   operation.check();
   if (!Number.isSafeInteger(compressedSize) || compressedSize < 0 ||
@@ -191,11 +206,25 @@ export async function streamLzma(
   const producer = (async (): Promise<void> => {
     for (let start = 0; start < compressedSize; start += 65536) {
       const size = Math.min(65536, compressedSize - start);
-      const input = await operation.wait(read(start, size));
-      if (input.length !== size) throw new CorruptError("LZMA input acquisition returned a short block");
-      for (let offset = 0; offset < input.length; offset += 16) {
-        await operation.wait(writer.write(input.subarray(offset, offset + 16)).catch(failed));
-        await operation.yield();
+      if (diagnostics) diagnostics.operationLzmaInputChunksStarted += 1;
+      const acquireStart = diagnostics ? performance.now() : undefined;
+      let input: Uint8Array;
+      try {
+        input = await operation.wait(read(start, size));
+        if (input.length !== size) throw new CorruptError("LZMA input acquisition returned a short block");
+        if (diagnostics) diagnostics.operationLzmaInputChunksAcquired += 1;
+      } finally {
+        if (diagnostics) diagnostics.operationLzmaInputAcquireMs += performance.now() - acquireStart!;
+      }
+      const feedStart = diagnostics ? performance.now() : undefined;
+      try {
+        for (let offset = 0; offset < input.length; offset += 16) {
+          await operation.wait(writer.write(input.subarray(offset, offset + 16)).catch(failed));
+          await operation.yield();
+        }
+        if (diagnostics) diagnostics.operationLzmaInputChunksFed += 1;
+      } finally {
+        if (diagnostics) diagnostics.operationLzmaFeedMs += performance.now() - feedStart!;
       }
     }
     await operation.wait(writer.close().catch(failed));

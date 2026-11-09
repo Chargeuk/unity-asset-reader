@@ -1216,6 +1216,16 @@ for (const [name, codec] of [["lz4.bundle", "lz4"], ["lzma.bundle", "lzma"], ["u
       assert.equal(snapshot.operationLzmaDecodes, codec === "lzma" ? 1 : 0);
       assert.equal(snapshot.operationLzmaCompleted, codec === "lzma" ? 1 : 0);
       assert.equal(snapshot.operationLzmaFailed, 0);
+      // The committed LZMA fixture is smaller than one input chunk. Other
+      // codecs must not acquire or feed any LZMA input, even with diagnostics.
+      const inputChunks = codec === "lzma" ? 1 : 0;
+      assert.equal(snapshot.operationLzmaInputChunksStarted, inputChunks);
+      assert.equal(snapshot.operationLzmaInputChunksAcquired, inputChunks);
+      assert.equal(snapshot.operationLzmaInputChunksFed, inputChunks);
+      for (const elapsed of [snapshot.operationLzmaInputAcquireMs, snapshot.operationLzmaFeedMs]) {
+        assert.ok(Number.isFinite(elapsed) && elapsed! >= 0);
+        if (codec !== "lzma") assert.equal(elapsed, 0);
+      }
       assert.equal(snapshot.operationDecodedBytes, snapshot.decodedBytes);
       assert.equal(snapshot.operationConsumerCalls, 1);
       assert.equal(snapshot.operationTurnsPending, 0);
@@ -1238,6 +1248,9 @@ for (const [name, codec] of [["lz4.bundle", "lz4"], ["lzma.bundle", "lzma"], ["u
       assert.equal(reader.diagnostics!.rangeBatches, 2);
       assert.equal(reader.diagnostics!.operationId, 2);
       assert.equal(reader.diagnostics!.operationLzmaDecodes, codec === "lzma" ? 1 : 0);
+      assert.equal(reader.diagnostics!.operationLzmaInputChunksStarted, inputChunks);
+      assert.equal(reader.diagnostics!.operationLzmaInputChunksAcquired, inputChunks);
+      assert.equal(reader.diagnostics!.operationLzmaInputChunksFed, inputChunks);
       assert.equal(reader.diagnostics!.operationDecodedBytes, snapshot.operationDecodedBytes);
       assert.equal(reader.diagnostics!.operationConsumerCalls, 1);
       assert.equal(reader.diagnostics!.operationYieldCalls, snapshot.operationYieldCalls,
@@ -1296,18 +1309,36 @@ for (const channel of ["port", "timer"] as const) {
 }
 
 for (const taskYieldPolicy of [undefined, "caller-owned"] as const) {
+for (const phase of ["input", "consumer"] as const) {
 for (const outcome of ["success", "reject", "abort", "close"] as const) {
-  test(`range diagnostic ownership survives a pending consumer and ${outcome}${taskYieldPolicy ? ` (${taskYieldPolicy})` : ""}`, async () => {
-    const reader = await openBundleRange(loadFixture("lzma.bundle"), undefined, {taskYieldPolicy});
+  test(`range diagnostic ownership survives a pending ${phase} and ${outcome}${taskYieldPolicy ? ` (${taskYieldPolicy})` : ""}`, async () => {
     const controller = new AbortController();
-    const reason = Object.freeze(new Error("owned pending consumer"));
+    const reason = Object.freeze(new Error(`owned pending ${phase}`));
     let entered!: () => void;
     const started = new Promise<void>((resolve) => { entered = resolve; });
     let release!: () => void;
     let reject!: (cause: unknown) => void;
     const consumer = new Promise<void>((resolve, fail) => { release = resolve; reject = fail; });
+    const data = loadFixture("lzma.bundle");
+    let readingBatch = false, sourceReads = 0, inputStartedAt = 0;
+    const reader = await openBundleRange(phase === "input" ? {
+      size: data.length,
+      slice(start: number, end: number) {
+        return {arrayBuffer: async () => {
+          // After opening, the first read acquires the five properties bytes;
+          // hold the actual compressed chunk so no successful feed is implied.
+          if (readingBatch && ++sourceReads === 2) {
+            inputStartedAt = performance.now();
+            entered();
+            await consumer;
+          }
+          return Uint8Array.from(data.subarray(start, end)).buffer;
+        }};
+      },
+    } : data, undefined, {taskYieldPolicy});
+    readingBatch = true;
     const pending = reader.readRanges([{entry: reader.entries[0]!, offset: 0, length: 1}],
-      () => { entered(); return consumer; }, controller.signal);
+      () => { if (phase === "consumer") { entered(); return consumer; } }, controller.signal);
     // Observe eagerly, including rejection after close/abort wins the owned race.
     const observed = pending.then(() => undefined, (cause: unknown) => cause);
     try {
@@ -1315,10 +1346,18 @@ for (const outcome of ["success", "reject", "abort", "close"] as const) {
       const live = reader.diagnostics!;
       assert.equal(live.operationId, 1);
       assert.equal(live.operationActive, 1);
-      assert.equal(live.consumerCalls, 1);
+      assert.equal(live.consumerCalls, phase === "consumer" ? 1 : 0);
       assert.equal(live.lzmaDecodes, 1);
       assert.equal(live.lzmaCompleted, 0);
+      assert.equal(live.operationLzmaInputChunksStarted, 1);
+      assert.equal(live.operationLzmaInputChunksAcquired, phase === "consumer" ? 1 : 0);
+      assert.ok(live.operationLzmaInputChunksFed! <= live.operationLzmaInputChunksAcquired!);
+      if (phase === "input") {
+        assert.equal(live.operationLzmaInputAcquireMs, 0, "unfinished acquisition is not settled elapsed");
+        assert.equal(live.operationLzmaFeedMs, 0);
+      }
       await assert.rejects(reader.readRanges([], () => {}), /active batch/);
+      const observedInputWaitMs = phase === "input" ? performance.now() - inputStartedAt : 0;
       if (outcome === "abort") controller.abort(reason);
       else if (outcome === "close") reader.close();
       else if (outcome === "reject") reject(reason);
@@ -1332,10 +1371,26 @@ for (const outcome of ["success", "reject", "abort", "close"] as const) {
       assert.equal(reader.diagnostics!.lzmaCompleted, outcome === "success" ? 1 : 0);
       assert.equal(reader.diagnostics!.lzmaFailed, outcome === "success" ? 0 : 1);
       assert.ok(reader.diagnostics!.consumerElapsedMs! >= 0);
+      const settled = reader.diagnostics!;
+      assert.equal(settled.operationLzmaInputChunksStarted, 1);
+      assert.equal(settled.operationLzmaInputChunksAcquired,
+        phase === "input" && outcome !== "success" ? 0 : 1);
+      assert.ok(settled.operationLzmaInputChunksFed! <= settled.operationLzmaInputChunksAcquired!);
+      if (outcome === "success") assert.equal(settled.operationLzmaInputChunksFed, 1);
+      if (phase === "input" && outcome !== "success") {
+        assert.equal(settled.operationLzmaInputChunksFed, 0);
+        assert.equal(settled.operationLzmaFeedMs, 0, "failed acquisition never started feeding");
+      }
+      for (const elapsed of [settled.operationLzmaInputAcquireMs, settled.operationLzmaFeedMs])
+        assert.ok(Number.isFinite(elapsed) && elapsed! >= 0);
+      if (phase === "input") assert.ok(settled.operationLzmaInputAcquireMs! >= observedInputWaitMs,
+        "settled acquisition includes the observed wait, including rejection/cancellation");
       assert.equal(live.operationActive, 1, "live snapshot was immutable, not retained mutable state");
+      assert.equal(live.operationLzmaInputChunksAcquired, phase === "consumer" ? 1 : 0);
       if (outcome === "abort" || outcome === "close") reject(reason);
     } finally { release(); reader.close(); await observed; }
   });
+}
 }
 }
 

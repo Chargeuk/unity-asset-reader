@@ -85,6 +85,23 @@ export interface BundleRangeDiagnostics {
   readonly operationLzmaCompleted?: number;
   readonly operationLzmaFailed?: number;
   readonly operationLzmaElapsedMs?: number;
+  /** Latest-batch counts of up-to-64-KiB compressed input chunks, excluding the
+   * five property bytes: attempted acquisitions, exact-size acquisitions, and
+   * chunks whose complete 16-byte-write/yield loop succeeded, respectively. */
+  readonly operationLzmaInputChunksStarted?: number;
+  readonly operationLzmaInputChunksAcquired?: number;
+  readonly operationLzmaInputChunksFed?: number;
+  /** Sum of acquisition elapsed milliseconds through logical settlement,
+   * including failed/cancelled attempts and source scheduling/I/O/resumption. */
+  readonly operationLzmaInputAcquireMs?: number;
+  /** Sum of whole-chunk feed elapsed milliseconds through logical settlement,
+   * including failed/cancelled feed loops, stream backpressure and task yields.
+   * Both totals omit an unfinished phase in a live snapshot (lower bounds on
+   * work begun); termination can prevent its final publication. Close/flush,
+   * final output drain and cleanup are outside these two producer phases.
+   * Concurrent output/consumer/turn elapsed overlaps them: never sum/subtract
+   * these values to infer exclusive CPU time or physical I/O cancellation. */
+  readonly operationLzmaFeedMs?: number;
   readonly operationDecodedBytes?: number;
   readonly operationConsumerCalls?: number;
   readonly operationConsumerElapsedMs?: number;
@@ -170,6 +187,8 @@ export async function openBundleRange(
     operationLzmaDecodes: number; operationLzmaCompleted: number; operationLzmaFailed: number;
     operationLzmaElapsedMs: number; operationDecodedBytes: number;
     operationConsumerCalls: number; operationConsumerElapsedMs: number;
+    operationLzmaInputChunksStarted: number; operationLzmaInputChunksAcquired: number;
+    operationLzmaInputChunksFed: number; operationLzmaInputAcquireMs: number; operationLzmaFeedMs: number;
   }) | undefined;
   try {
     const size = source instanceof Uint8Array ? source.length : source.size;
@@ -282,6 +301,8 @@ export async function openBundleRange(
         operationTurnAwaitMs: 0, operationPortTurns: 0, operationTimerTurns: 0,
         operationLzmaDecodes: 0, operationLzmaCompleted: 0, operationLzmaFailed: 0,
         operationLzmaElapsedMs: 0, operationDecodedBytes: 0,
+        operationLzmaInputChunksStarted: 0, operationLzmaInputChunksAcquired: 0,
+        operationLzmaInputChunksFed: 0, operationLzmaInputAcquireMs: 0, operationLzmaFeedMs: 0,
         operationConsumerCalls: 0, operationConsumerElapsedMs: 0 };
       operationMetrics = metrics;
       const op = new RangeOperation(abortSignal, metrics, taskYieldPolicy);
@@ -380,7 +401,7 @@ export async function openBundleRange(
               const start = performance.now();
               try {
                 await streamLzma(props, (offset, length) => read(offset + 5, length),
-                  block.compressedSize - 5, block.uncompressedSize, output, op);
+                  block.compressedSize - 5, block.uncompressedSize, output, op, metrics);
                 diagnostics.lzmaCompleted += 1;
                 metrics.operationLzmaCompleted += 1;
               } catch (error) {

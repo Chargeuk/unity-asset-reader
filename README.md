@@ -20,6 +20,16 @@ elapsed ends on logical settlement/cancellation, not physical task cancellation.
 LZMA stream elapsed includes acquisition, task waits and selected-consumer pressure;
 metadata publication may instead follow decoding. Concurrent turn waits may overlap.
 These elapsed values cannot be summed/subtracted to infer exclusive CPU time.
+The latest-batch `operationLzmaInputChunksStarted`, `operationLzmaInputChunksAcquired`, and
+`operationLzmaInputChunksFed` count attempted up-to-64-KiB payload reads (excluding the five
+property bytes), exact-size acquisitions, and chunks whose full 16-byte-write/yield loops
+succeeded; they reset per batch and are zero for non-LZMA work. `operationLzmaInputAcquireMs`
+and `operationLzmaFeedMs` sum acquisition and feed elapsed through logical settlement,
+including failed or cancelled attempts, scheduling/I/O and feed backpressure/yields. A live
+snapshot omits an unfinished phase, so its total is a lower bound; termination can prevent
+final publication, and close, final drain and cleanup are outside these phases. Feed overlaps
+output, consumer and task waits: these are not exclusive CPU, native or I/O costs, and a fed
+count or logical cancellation does not establish stream success or physical I/O termination.
 
 `openBundleRange(input, signal?, options?)` accepts
 `{ taskYieldPolicy?: "cooperative" | "caller-owned" }` (`BundleRangeOptions`).
